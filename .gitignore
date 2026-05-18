@@ -19,3 +19,14 @@ build/
 .idea/
 .DS_Store
 *.swp
+
+# Secrets / credentials (defense-in-depth — should never be committed)
+.env
+.env.*
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials.*
