@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Build artifacts
+dist/
+build/
+
+# OMC scratch / session state
+.omc/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
