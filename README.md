@@ -39,7 +39,7 @@ check the survey report).
 
 ## Use
 
-1. Pick the `.xml` file (e.g. `RDB_TPH-740_4200_-_UE_FM_EP_N_Trassierung_001.xml`).
+1. Pick the `.xml` file (e.g. `Trassierung_001.xml`).
 2. Confirm the CRS (e.g. `EPSG:31256`).
 3. A memory layer `Alignments — <filename>` is added, one feature per
    `<Alignment>`. Attributes: `name`, `length_xml`, `length_geom`,
