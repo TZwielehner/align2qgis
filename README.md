@@ -1,16 +1,22 @@
 # align2qgis
 
 QGIS 3 plugin: import LandXML horizontal alignments (lines, circular arcs,
-clothoid spirals) as a memory line layer.
+clothoid spirals) as a native curved-geometry layer.
 
 ## What it handles
 
 | LandXML element            | Method                                                       |
 | -------------------------- | ------------------------------------------------------------ |
 | `<Line>`                   | Straight segment, two points.                                |
-| `<Curve rot="cw\|ccw">`    | Exact circular-arc math from `Start`, `Center`, `End`.       |
-| `<Spiral spiType="clothoid">` | Numerical integration of θ(s) = k₀s + (k₁−k₀)s²/(2L). |
+| `<Curve rot="cw\|ccw">`    | Exact circular-arc math from `Start`, `Center`, `End`, emitted as a `CircularString` sub-curve. |
+| `<Spiral spiType="clothoid">` | Numerical integration of θ(s) = k₀s + (k₁−k₀)s²/(2L), then discretized into a chain of circular arcs (per-arc chord error ≤ 1 cm by default). |
 | Anything else              | Skipped with a warning in the QGIS log.                      |
+
+Geometry: each alignment is emitted as a `CompoundCurve` of line +
+circular-arc sub-curves, so QGIS' offset / buffer / length operations use
+the analytic curve rather than a chord polyline. This matters when
+deriving lane edges or parallel features at significant offsets — the
+polyline approach produces visible faceting that the arc chain avoids.
 
 Coordinates: LandXML stores points as `Northing Easting [Elevation]`.
 The plugin swaps to QGIS axis order (x = Easting, y = Northing) in
@@ -63,15 +69,17 @@ python3 -m unittest discover -s tests
 python3 -c "import tests.test_geometry as t; [getattr(t,n)() for n in dir(t) if n.startswith('test_')]"
 ```
 
-7 tests cover the parser, axis swap, both arc sweep directions, the
-infinite-radius spiral edge case, and a Fresnel cross-check at the spiral
-mid-point.
+Tests cover the parser, axis swap, both arc sweep directions, the
+infinite-radius spiral edge case, a Fresnel cross-check at the spiral
+mid-point, the clothoid → arc-chain discretization (endpoint matching +
+per-arc chord error within budget), and the chainage walker.
 
 ## Known limits
 
-- No vertical alignment / profile yet — only `<CoordGeom>` is consumed.
 - `<IrregularLine>`, `<Chain>`, station equations: not handled.
-- The clothoid is integrated with a trapezoidal rule (~0.5 samples/m
-  default). Discretization error grows with spiral length; pin endpoints
-  is applied automatically so the polyline lands exactly on `<End>`.
+- Clothoid arc-discretization is driven by `|dκ/ds|·h³/24 ≤ ε` with
+  ε = 1 cm. The chain's outer endpoints are still pinned to the LandXML
+  `<Start>` / `<End>` to absorb integration drift on long spirals — a
+  geometrically inconsistent LandXML end will be honoured rather than
+  corrected.
 - CRS must be supplied by the user; LandXML provides none.
