@@ -127,7 +127,10 @@ def build_alignment_layer(
         cc = _compound_curve_from_pieces(pieces)
         if cc.nCurves() == 0:
             continue
-        geom = QgsGeometry(cc)
+        # ``QgsGeometry(cc)`` would transfer ownership of ``cc``; the
+        # ``.clone()`` keeps that transfer unambiguous under QGIS 4's SIP
+        # bindings without affecting QGIS 3 behaviour.
+        geom = QgsGeometry(cc.clone())
         feat = QgsFeature(layer.fields())
         feat.setGeometry(geom)
         feat.setAttribute("name", alignment.name)
@@ -215,7 +218,7 @@ def build_segment_layer(
             cc = _compound_curve_from_pieces(pieces)
             if cc.nCurves() == 0:
                 continue
-            geom = QgsGeometry(cc)
+            geom = QgsGeometry(cc.clone())
 
             k_start, k_end = segment_curvature(seg)
             radius_start = (1.0 / k_start) if abs(k_start) > 1e-12 else None
