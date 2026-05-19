@@ -13,4 +13,6 @@ category=Vector
 icon=icon.png
 experimental=True
 deprecated=False
+supportsQt6=yes
+hasProcessingProvider=no
 tags=landxml,alignment,survey,civil,horizontal alignment,clothoid,spiral
