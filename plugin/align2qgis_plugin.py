@@ -23,6 +23,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 from qgis.core import (
+    Qgis,
     QgsMapLayer,
     QgsProject,
     QgsVectorLayer,
@@ -393,7 +394,9 @@ class Align2QgisPlugin:
             f"{action} {n_align} alignment(s) from {base} → "
             f"{n_layers} layer(s) ({target})"
         )
-        self.iface.messageBar().pushMessage(PLUGIN_NAME, msg, level=0, duration=6)
+        self.iface.messageBar().pushMessage(
+            PLUGIN_NAME, msg, level=Qgis.MessageLevel.Info, duration=6
+        )
 
     def _parse_or_error(self, path: str):
         try:
