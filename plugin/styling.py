@@ -87,9 +87,12 @@ def _apply_rotated_labels(
         QgsVectorLayerSimpleLabeling,
     )
     from qgis.PyQt.QtGui import QColor, QFont
+    from qgis.PyQt.QtWidgets import QApplication
 
     text = QgsTextFormat()
-    font = QFont()
+    # QFont() defaults to "MS Shell Dlg 2" on Qt 6, an alias QGIS 4 can't
+    # render — use the app font (a real resolved family) instead.
+    font = QFont(QApplication.font())
     font.setPointSize(font_size)
     font.setBold(bold)
     text.setFont(font)
