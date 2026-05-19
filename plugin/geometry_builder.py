@@ -192,6 +192,146 @@ def _solve_rotation_from_endpoints(
 
 
 # ---------------------------------------------------------------------------
+# Curve-piece discretization — line / circular-arc primitives that QGIS can
+# render exactly as a CompoundCurve. Used by the layer builders for the
+# Alignments and Segments outputs so offsets, buffers, and labeling against
+# the alignment don't inherit the chord-faceting of a polyline approximation.
+# Each arc piece is described by three points (start, on-arc midpoint, end),
+# the form CircularString accepts.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class LinePiece:
+    start: XY
+    end: XY
+
+
+@dataclass(frozen=True)
+class ArcPiece:
+    start: XY
+    mid: XY  # any point on the arc strictly between start and end
+    end: XY
+
+
+CurvePiece = LinePiece | ArcPiece
+
+
+def _curve_arc_piece(seg: CurveSeg) -> ArcPiece | LinePiece | None:
+    """One ArcPiece for a CurveSeg — exact, no approximation.
+
+    Degenerate (zero-length) curves collapse to a 2-point LinePiece so the
+    output still joins, matching how :func:`arc_points` handles them.
+    """
+    sx, sy = ne_to_xy(seg.start)
+    ex, ey = ne_to_xy(seg.end)
+    cx, cy, r, a0, dtheta, length = _arc_geometry(seg)
+    if length <= 0 or r <= 0:
+        return LinePiece((sx, sy), (ex, ey))
+    a_mid = a0 + dtheta / 2.0
+    mx = cx + r * math.cos(a_mid)
+    my = cy + r * math.sin(a_mid)
+    return ArcPiece((sx, sy), (mx, my), (ex, ey))
+
+
+def spiral_arc_triples(
+    seg: SpiralSeg, max_chord_err: float = 0.01,
+) -> list[tuple[XY, XY, XY]]:
+    """Approximate a clothoid as a chain of circular arcs in world XY.
+
+    Each tuple is ``(start, on-arc midpoint, end)`` — the three points a
+    ``QgsCircularString`` needs. Consecutive arcs share an endpoint so the
+    chain is gap-free.
+
+    Piece count is chosen from the clothoid's curvature gradient
+    ``dκ/ds = (k1 - k0) / L``. A 3-point arc fit through a clothoid piece of
+    length ``h`` has third-order chord error ≈ ``|dκ/ds| · h³ / 24``, so
+    setting ``h ≤ (24 · max_chord_err / |dκ/ds|)^(1/3)`` keeps the per-arc
+    deviation under the budget. Straight or constant-radius spirals
+    (``dκ/ds ≈ 0``) collapse to a single piece.
+    """
+    sx, sy = ne_to_xy(seg.start)
+    ex, ey = ne_to_xy(seg.end)
+    L = seg.length
+    if L <= 0:
+        return []
+
+    sign = -1.0 if seg.rot.lower() == "cw" else 1.0
+    k0 = 0.0 if seg.radius_start is None else sign / seg.radius_start
+    k1 = 0.0 if seg.radius_end is None else sign / seg.radius_end
+
+    err = max(max_chord_err, 1e-6)
+    dk_ds = abs(k1 - k0) / L
+    if dk_ds < 1e-12:
+        n_arcs = 1
+    else:
+        h_max = (24.0 * err / dk_ds) ** (1.0 / 3.0)
+        n_arcs = max(1, int(math.ceil(L / h_max)))
+
+    # Sample on a grid twice as fine as the arc count so each arc gets a
+    # start, midpoint, and end taken directly from the integrated clothoid.
+    n_samples = 2 * n_arcs
+    local = _local_clothoid(L, k0, k1, n_samples)
+
+    if seg.pi is not None:
+        px, py = ne_to_xy(seg.pi)
+        tx, ty = px - sx, py - sy
+        norm = math.hypot(tx, ty)
+        if norm > 1e-9:
+            cos_a, sin_a = tx / norm, ty / norm
+        else:
+            cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
+    else:
+        cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
+
+    world: list[XY] = []
+    for lx, ly in local:
+        world.append((sx + cos_a * lx - sin_a * ly, sy + sin_a * lx + cos_a * ly))
+    # Pin the chain's outer endpoints to the LandXML values — small
+    # integration drift is expected on long spirals.
+    world[0] = (sx, sy)
+    world[-1] = (ex, ey)
+
+    triples: list[tuple[XY, XY, XY]] = []
+    for i in range(n_arcs):
+        triples.append((world[2 * i], world[2 * i + 1], world[2 * i + 2]))
+    return triples
+
+
+def segment_curve_pieces(
+    seg: Segment, max_chord_err: float = 0.01,
+) -> list[CurvePiece]:
+    """Decompose a segment into line / circular-arc pieces.
+
+    Lines pass through unchanged; circular arcs become one ArcPiece;
+    clothoid spirals become a chain of ArcPieces sized by ``max_chord_err``.
+    """
+    if isinstance(seg, LineSeg):
+        sx, sy = ne_to_xy(seg.start)
+        ex, ey = ne_to_xy(seg.end)
+        return [LinePiece((sx, sy), (ex, ey))]
+    if isinstance(seg, CurveSeg):
+        piece = _curve_arc_piece(seg)
+        return [piece] if piece is not None else []
+    if isinstance(seg, SpiralSeg):
+        return [ArcPiece(s, m, e) for s, m, e in spiral_arc_triples(seg, max_chord_err)]
+    raise TypeError(f"unknown segment type: {type(seg).__name__}")
+
+
+def alignment_curve_pieces(
+    alignment: Alignment, max_chord_err: float = 0.01,
+) -> list[CurvePiece]:
+    """Concatenate every segment's curve pieces into one ordered list.
+
+    No deduplication between pieces is needed — adjacent segments already
+    share endpoints by construction, and CompoundCurve assembly tolerates
+    coincident join points.
+    """
+    out: list[CurvePiece] = []
+    for seg in alignment.segments:
+        out.extend(segment_curve_pieces(seg, max_chord_err))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
 def segment_points(seg: Segment) -> list[XY]:

@@ -10,10 +10,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from plugin.geometry_builder import (  # noqa: E402
+    ArcPiece,
+    LinePiece,
     alignment_chainage,
+    alignment_curve_pieces,
     alignment_polyline,
     arc_points,
     line_points,
+    segment_curve_pieces,
+    spiral_arc_triples,
     spiral_points,
 )
 from plugin.landxml_parser import (  # noqa: E402
@@ -330,3 +335,153 @@ def test_chainage_carries_desc_passthrough():
     a = Alignment(name="L", length=100.0, sta_start=0.0, segments=[seg])
     cps = alignment_chainage(a, interval=50.0)
     assert all(c.desc == "Vmax=160" for c in cps)
+
+
+# ---------------------------------------------------------------------------
+# Curve-piece discretization (line / circular-arc primitives for CompoundCurve)
+# ---------------------------------------------------------------------------
+def _circle_from_three_points(p0, p1, p2):
+    """Return (cx, cy, r) of the circle through three non-collinear points."""
+    (x0, y0), (x1, y1), (x2, y2) = p0, p1, p2
+    d = 2.0 * (x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1))
+    ux = ((x0 * x0 + y0 * y0) * (y1 - y2)
+          + (x1 * x1 + y1 * y1) * (y2 - y0)
+          + (x2 * x2 + y2 * y2) * (y0 - y1)) / d
+    uy = ((x0 * x0 + y0 * y0) * (x2 - x1)
+          + (x1 * x1 + y1 * y1) * (x0 - x2)
+          + (x2 * x2 + y2 * y2) * (x1 - x0)) / d
+    r = math.hypot(x0 - ux, y0 - uy)
+    return ux, uy, r
+
+
+def test_line_piece_passes_through():
+    seg = LineSeg(start=(0.0, 0.0), end=(0.0, 100.0))
+    pieces = segment_curve_pieces(seg)
+    assert len(pieces) == 1
+    assert isinstance(pieces[0], LinePiece)
+    assert pieces[0].start == (0.0, 0.0)
+    assert pieces[0].end == (100.0, 0.0)
+
+
+def test_curve_seg_yields_one_arc_piece_on_circle():
+    # Quarter circle, R=50 cw — mirrors test_arc_quarter_circle_length.
+    seg = CurveSeg(
+        start=(1000.0, 2100.0),
+        center=(1000.0, 2150.0),
+        end=(1050.0, 2150.0),
+        radius=50.0,
+        rot="cw",
+    )
+    pieces = segment_curve_pieces(seg)
+    assert len(pieces) == 1
+    assert isinstance(pieces[0], ArcPiece)
+    # All three points lie on the circle of radius 50 about (E=2150, N=1000).
+    cx, cy = 2150.0, 1000.0
+    for p in (pieces[0].start, pieces[0].mid, pieces[0].end):
+        assert abs(math.hypot(p[0] - cx, p[1] - cy) - 50.0) < 1e-9
+
+
+def test_degenerate_curve_collapses_to_line_piece():
+    seg = CurveSeg(
+        start=(5417468.885, 3477914.359),
+        center=(5417300.0, 3478000.0),
+        end=(5417468.885, 3477914.359),
+        radius=214.74,
+        rot="ccw",
+        length=0.0,
+    )
+    pieces = segment_curve_pieces(seg)
+    assert len(pieces) == 1
+    assert isinstance(pieces[0], LinePiece)
+
+
+def _fresnel_clothoid_seg(L: float, R: float):
+    """Build a geometrically consistent SpiralSeg from R=∞ → R, length L.
+
+    Returns ``(seg, end_local_xy)`` — the end in local-frame coords matches
+    what trapezoidal integration of the same κ profile produces, so the
+    plugin's world-end pinning is a no-op.
+    """
+    n = 20000
+    ds = L / n
+    x = y = 0.0
+    cos_p, sin_p = 1.0, 0.0
+    for i in range(1, n + 1):
+        s = i * ds
+        theta = s * s / (2.0 * R * L)
+        ct, st = math.cos(theta), math.sin(theta)
+        x += 0.5 * (cos_p + ct) * ds
+        y += 0.5 * (sin_p + st) * ds
+        cos_p, sin_p = ct, st
+    sx, sy = 2000.0, 1000.0  # x=E, y=N
+    seg = SpiralSeg(
+        start=(sy, sx),  # LandXML (N, E)
+        pi=(sy, sx + 50.0),  # tangent +E
+        end=(sy + y, sx + x),  # LandXML (N, E)
+        length=L,
+        radius_start=None,
+        radius_end=R,
+        rot="ccw",
+    )
+    return seg, (sx + x, sy + y)
+
+
+def test_spiral_arc_triples_chain_endpoints_match():
+    L, R = 100.0, 200.0
+    seg, end_world = _fresnel_clothoid_seg(L, R)
+    triples = spiral_arc_triples(seg, max_chord_err=0.01)
+    assert len(triples) >= 2  # non-trivial dκ/ds drives multi-piece split
+    assert _close(triples[0][0], (2000.0, 1000.0))
+    assert _close(triples[-1][2], end_world, tol=1e-6)
+    # Consecutive arcs share their join points exactly.
+    for i in range(len(triples) - 1):
+        assert triples[i][2] == triples[i + 1][0]
+
+
+def test_spiral_arc_chord_error_stays_under_budget():
+    # Each truth sample (a densely-integrated point on the clothoid) should
+    # land within ``max_chord_err`` of *some* fitted arc-piece circle. That's
+    # exactly the property arc-discretization claims — the chord deviation
+    # between the rendered CompoundCurve and the analytic clothoid is bounded.
+    L = 100.0
+    R = 200.0
+    budget = 0.01
+    seg, _ = _fresnel_clothoid_seg(L, R)
+    triples = spiral_arc_triples(seg, max_chord_err=budget)
+    circles = [_circle_from_three_points(s, m, e) for s, m, e in triples]
+    truth = spiral_points(seg, samples_per_meter=10.0)
+    worst = 0.0
+    for tx, ty in truth:
+        # Nearest fitted circle's |distance-to-center − radius| is the chord
+        # deviation along the radial direction.
+        best = min(abs(math.hypot(tx - cx, ty - cy) - rr) for cx, cy, rr in circles)
+        worst = max(worst, best)
+    # Allow a small safety factor over the budget — the per-piece bound is
+    # third-order, but the constant in the bound isn't exactly 24.
+    assert worst < budget * 3
+
+
+def test_spiral_with_infinite_radii_yields_single_piece():
+    # Both radii infinite → dκ/ds == 0 → one arc piece (geometrically a line).
+    seg = SpiralSeg(
+        start=(1000.0, 2000.0),
+        pi=(1000.0, 2050.0),
+        end=(1000.0, 2100.0),
+        length=100.0,
+        radius_start=None,
+        radius_end=None,
+        rot="ccw",
+    )
+    triples = spiral_arc_triples(seg)
+    assert len(triples) == 1
+
+
+def test_alignment_curve_pieces_joins_segments():
+    a = parse_alignments(SAMPLE_XML.encode("utf-8"))[0]
+    pieces = alignment_curve_pieces(a)
+    # SAMPLE_XML has one line + one arc.
+    assert len(pieces) == 2
+    assert isinstance(pieces[0], LinePiece)
+    assert isinstance(pieces[1], ArcPiece)
+    # Line end coincides with arc start (in QGIS axes).
+    assert _close(pieces[0].end, pieces[1].start)

@@ -14,10 +14,14 @@ import re
 
 from qgis.PyQt.QtCore import QMetaType
 from qgis.core import (
+    QgsCircularString,
+    QgsCompoundCurve,
     QgsCoordinateReferenceSystem,
     QgsFeature,
     QgsField,
     QgsGeometry,
+    QgsLineString,
+    QgsPoint,
     QgsPointXY,
     QgsVectorLayer,
 )
@@ -25,12 +29,14 @@ from qgis.core import (
 from .constants import PROP_CRS, PROP_SOURCE_PATH, SOURCE_FILE_FIELD
 from .dimensions import build_dimensions
 from .geometry_builder import (
+    ArcPiece,
+    LinePiece,
     alignment_chainage,
-    alignment_polyline,
+    alignment_curve_pieces,
     alignment_xy_at_station,
     segment_curvature,
+    segment_curve_pieces,
     segment_length,
-    segment_points,
 )
 from .landxml_parser import CurveSeg, LandXMLMetadata, SpiralSeg, VertCurve
 from .stationing import format_station, upright_bearing
@@ -66,6 +72,29 @@ def _new_memory_layer(
     return layer
 
 
+def _compound_curve_from_pieces(pieces) -> QgsCompoundCurve:
+    """Build a QgsCompoundCurve from a list of LinePiece / ArcPiece values.
+
+    Lines become two-point ``QgsLineString`` sub-curves; arcs become
+    three-point ``QgsCircularString`` sub-curves. QGIS stores this as native
+    curved geometry — offsets, buffers, and length() use the analytic
+    formulas rather than the chord polyline.
+    """
+    cc = QgsCompoundCurve()
+    for piece in pieces:
+        if isinstance(piece, LinePiece):
+            cc.addCurve(QgsLineString([
+                QgsPoint(*piece.start), QgsPoint(*piece.end),
+            ]))
+        elif isinstance(piece, ArcPiece):
+            cc.addCurve(QgsCircularString(
+                QgsPoint(*piece.start),
+                QgsPoint(*piece.mid),
+                QgsPoint(*piece.end),
+            ))
+    return cc
+
+
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
@@ -79,18 +108,26 @@ def build_alignment_layer(
     imported_at: str = "",
     metadata: LandXMLMetadata | None = None,
 ) -> QgsVectorLayer:
-    """One polyline feature per alignment — the rendered horizontal curve."""
+    """One CompoundCurve feature per alignment — the rendered horizontal curve.
+
+    Lines stay as line segments and arcs/spirals are emitted as native
+    circular-arc sub-curves so QGIS renders, offsets, and measures them
+    analytically rather than as chord polylines.
+    """
     layer = _new_memory_layer(
-        layer_name, crs_authid, "LineString", alignment_fields(),
+        layer_name, crs_authid, "CompoundCurve", alignment_fields(),
     )
     meta = metadata or LandXMLMetadata()
 
     features: list[QgsFeature] = []
     for alignment in alignments:
-        pts = alignment_polyline(alignment)
-        if len(pts) < 2:
+        pieces = alignment_curve_pieces(alignment)
+        if not pieces:
             continue
-        geom = QgsGeometry.fromPolylineXY([QgsPointXY(x, y) for x, y in pts])
+        cc = _compound_curve_from_pieces(pieces)
+        if cc.nCurves() == 0:
+            continue
+        geom = QgsGeometry(cc)
         feat = QgsFeature(layer.fields())
         feat.setGeometry(geom)
         feat.setAttribute("name", alignment.name)
@@ -155,9 +192,14 @@ def build_segment_layer(
     *,
     source_file: str = "",
 ) -> QgsVectorLayer:
-    """One polyline feature per LandXML segment (Line / Curve / Spiral)."""
+    """One CompoundCurve feature per LandXML segment (Line / Curve / Spiral).
+
+    Circular arcs are emitted exactly; clothoid spirals are discretized into
+    a chain of circular arcs whose chord deviation from the true clothoid
+    stays under a centimeter for typical road geometry.
+    """
     layer = _new_memory_layer(
-        layer_name, crs_authid, "LineString", segment_fields(),
+        layer_name, crs_authid, "CompoundCurve", segment_fields(),
     )
 
     features: list[QgsFeature] = []
@@ -167,10 +209,13 @@ def build_segment_layer(
             length = segment_length(seg)
             if length <= 0:
                 continue
-            pts = segment_points(seg)
-            if len(pts) < 2:
+            pieces = segment_curve_pieces(seg)
+            if not pieces:
                 continue
-            geom = QgsGeometry.fromPolylineXY([QgsPointXY(x, y) for x, y in pts])
+            cc = _compound_curve_from_pieces(pieces)
+            if cc.nCurves() == 0:
+                continue
+            geom = QgsGeometry(cc)
 
             k_start, k_end = segment_curvature(seg)
             radius_start = (1.0 / k_start) if abs(k_start) > 1e-12 else None
