@@ -25,6 +25,15 @@ asks for one (`EPSG:25832` is offered by default; for AT/DE rail data this is
 often `EPSG:31256`, `EPSG:31287`, or a project-specific Gauß-Krüger zone —
 check the survey report).
 
+## Compatibility
+
+Targets QGIS 3.22+ and QGIS 4 (Qt6). The codebase uses the `qgis.PyQt`
+shim, `QMetaType.Type` field types, and the `Qgis.*` enum forms
+(`Qgis.MessageLevel`, `Qgis.MarkerShape`) so the same source works
+against both PyQt5 and PyQt6 builds. `QgsCompoundCurve` instances are
+wrapped via `QgsGeometry(cc.clone())` for unambiguous ownership transfer
+under QGIS 4's stricter SIP bindings.
+
 ## Install in QGIS
 
 1. Locate your QGIS plugin directory:
