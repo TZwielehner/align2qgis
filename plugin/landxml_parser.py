@@ -408,6 +408,87 @@ _INSPECT_TAGS = (
 )
 
 
+def _profile_items_sorted(profile: Profile) -> list:
+    """Flatten all ProfAlign elements into one sorted list keyed by station."""
+    items = []
+    for prof_align in profile.alignments:
+        items.extend(prof_align.elements)
+    items.sort(key=lambda x: x.station)
+    return items
+
+
+def _grade_between(items: list, i_left: int, i_right: int) -> float:
+    if i_left < 0 or i_right >= len(items):
+        return 0.0
+    dx = items[i_right].station - items[i_left].station
+    if abs(dx) < 1e-9:
+        return 0.0
+    return (items[i_right].elev - items[i_left].elev) / dx
+
+
+def profile_elevation_at_station(
+    profile: Profile | None, station: float,
+) -> float | None:
+    """Closed-form elevation at ``station`` along ``profile``.
+
+    Evaluates the parabolic vertical curve when ``station`` falls inside a
+    ``<ParaCurve>`` / ``<CircCurve>`` / ``<UnsymParaCurve>`` span, and
+    linearly interpolates between adjacent tangent endpoints otherwise.
+    Returns ``None`` when the station is outside the profile's range.
+
+    ``station`` is interpreted in the same coordinate system the profile's
+    items use — typically the alignment's *displayed* stations, so callers
+    holding an alignment-internal value should run it through
+    :func:`internal_to_display` first.
+
+    Mirrors the math in :func:`profile_samples` (which densifies the same
+    profile at fixed step) so the two stay numerically consistent.
+    """
+    if profile is None:
+        return None
+    items = _profile_items_sorted(profile)
+    if not items:
+        return None
+    n = len(items)
+    s = station
+
+    # Inside a vertical curve?
+    for i, item in enumerate(items):
+        if not (isinstance(item, VertCurve) and item.length > 0):
+            continue
+        L = item.length
+        sta_bvc = item.station - L / 2.0
+        sta_evc = item.station + L / 2.0
+        if sta_bvc - 1e-9 <= s <= sta_evc + 1e-9:
+            g_back = _grade_between(items, i - 1, i) if i > 0 else 0.0
+            g_ahead = _grade_between(items, i, i + 1) if i < n - 1 else 0.0
+            elev_bvc = item.elev - (L / 2.0) * g_back
+            ds = s - sta_bvc
+            return elev_bvc + g_back * ds + (g_ahead - g_back) / (2.0 * L) * ds * ds
+
+    # On a tangent between two items — each item's tangent endpoint sits on
+    # the connecting tangent at BVC/EVC distance from its PVI station.
+    for i in range(n - 1):
+        cur, nxt = items[i], items[i + 1]
+        L_cur = cur.length if isinstance(cur, VertCurve) and cur.length > 0 else 0.0
+        L_nxt = nxt.length if isinstance(nxt, VertCurve) and nxt.length > 0 else 0.0
+        sta_l = cur.station + L_cur / 2.0
+        sta_r = nxt.station - L_nxt / 2.0
+        if sta_l - 1e-9 <= s <= sta_r + 1e-9:
+            if sta_r - sta_l < 1e-9:
+                return cur.elev
+            g = (nxt.elev - cur.elev) / (nxt.station - cur.station)
+            elev_l = cur.elev + (L_cur / 2.0) * g
+            return elev_l + (s - sta_l) * g
+
+    # Boundary stations exactly at the first/last item.
+    if abs(s - items[0].station) < 1e-9:
+        return items[0].elev
+    if abs(s - items[-1].station) < 1e-9:
+        return items[-1].elev
+    return None
+
+
 def profile_samples(
     profile: Profile | None, step: float = 1.0
 ) -> list[tuple[float, float]]:

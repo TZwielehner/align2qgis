@@ -366,6 +366,48 @@ def alignment_curve_pieces(
     return out
 
 
+def alignment_curve_pieces_3d(
+    alignment: Alignment, max_chord_err: float = 0.01,
+) -> list[tuple[CurvePiece, list[float]]]:
+    """Each piece + the alignment-*internal* station at every defining vertex.
+
+    ``LinePiece`` carries two stations (start, end); ``ArcPiece`` carries
+    three (start, on-arc midpoint, end). Callers run those stations through
+    :func:`internal_to_display` then :func:`profile_elevation_at_station` to
+    fetch Z, and pass the resulting points into ``QgsCircularString`` /
+    ``QgsLineString`` constructors to build a ``CompoundCurveZ`` feature.
+
+    Spirals are discretized into N equal-arclength arcs, so vertex stations
+    are simply ``cum + i·h``, ``cum + (i + 0.5)·h``, ``cum + (i + 1)·h``
+    for piece ``i`` where ``h = L / N``.
+    """
+    out: list[tuple[CurvePiece, list[float]]] = []
+    cum = alignment.sta_start or 0.0
+    for seg in alignment.segments:
+        L = segment_length(seg)
+        if L <= 0:
+            continue
+        pieces = segment_curve_pieces(seg, max_chord_err)
+        if isinstance(seg, SpiralSeg):
+            n = len(pieces) or 1
+            h = L / n
+            for i, piece in enumerate(pieces):
+                s0 = cum + i * h
+                if isinstance(piece, ArcPiece):
+                    out.append((piece, [s0, s0 + h / 2.0, s0 + h]))
+                else:
+                    out.append((piece, [s0, s0 + h]))
+        else:
+            # Line or single circular arc — one piece spans the whole segment.
+            for piece in pieces:
+                if isinstance(piece, ArcPiece):
+                    out.append((piece, [cum, cum + L / 2.0, cum + L]))
+                else:
+                    out.append((piece, [cum, cum + L]))
+        cum += L
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
