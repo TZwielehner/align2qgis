@@ -11,11 +11,17 @@ from qgis.core import QgsVectorLayer
 
 
 def apply_station_labels(layer: QgsVectorLayer) -> None:
-    """Rotated text labels for the stations layer, offset above the tick."""
-    # Larger offset than the default 1.5 mm so text clears the perpendicular
-    # tick mark that :func:`apply_station_symbol` renders on the same layer.
+    """Rotated text labels for the stations layer, anchored to the side of the tick."""
+    # Anchor the label's lower-left corner ahead of the tick so it reads off
+    # to one side rather than sitting centered over the dash.
     _apply_rotated_labels(
-        layer, field="label", font_size=8, color=(40, 40, 40), y_offset=3.5
+        layer,
+        field="label",
+        font_size=8,
+        color=(40, 40, 40),
+        x_offset=1.5,
+        y_offset=1.5,
+        quad="QuadrantAboveRight",
     )
 
 
@@ -93,7 +99,7 @@ def apply_station_symbol(layer: QgsVectorLayer) -> None:
         except AttributeError:
             from qgis.core import Qgis
             marker.setShape(Qgis.MarkerShape.Line)
-        marker.setSize(3.5)  # mm — ~1.75 mm of tick on each side of the line
+        marker.setSize(2.0)  # mm — short dash, ~1 mm on each side of the line
         marker.setColor(QColor(60, 60, 60))
         marker.setStrokeColor(QColor(60, 60, 60))
         marker.setStrokeWidth(0.3)
@@ -118,7 +124,9 @@ def _apply_rotated_labels(
     font_size: int,
     color: tuple[int, int, int],
     bold: bool = False,
+    x_offset: float = 0.0,
     y_offset: float = 1.5,
+    quad: str = "QuadrantAbove",
 ) -> None:
     """Enable text labels rotated by the ``rotation`` field of ``layer``.
 
@@ -157,9 +165,12 @@ def _apply_rotated_labels(
     except (AttributeError, TypeError) as exc:
         print(f"[align2qgis] label placement skipped: {exc}")
     try:
-        pal.quadOffset = QgsPalLayerSettings.QuadrantAbove
+        pal.quadOffset = getattr(
+            QgsPalLayerSettings, quad, QgsPalLayerSettings.QuadrantAbove
+        )
     except AttributeError as exc:
         print(f"[align2qgis] label quadrant offset skipped: {exc}")
+    pal.xOffset = x_offset
     pal.yOffset = y_offset
 
     try:
