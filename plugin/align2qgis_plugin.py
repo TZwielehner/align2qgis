@@ -16,9 +16,8 @@ import os
 from typing import TYPE_CHECKING
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtGui import QAction, QIcon
 from qgis.PyQt.QtWidgets import (
-    QAction,
     QDialog,
     QFileDialog,
     QMessageBox,
