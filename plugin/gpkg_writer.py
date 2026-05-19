@@ -41,7 +41,11 @@ def write_layers_to_gpkg(
     Returns ``[(gpkg_path, gpkg_layer_name, display_name), …]`` so callers
     can re-load the persisted layers as GPKG-backed vectors.
     """
-    is_new_file = not os.path.exists(gpkg_path)
+    # Treat empty placeholder files (size 0) as new — QGIS' "Save As" dialog
+    # often touches the path before the writer runs, leaving a 0-byte file.
+    is_new_file = (
+        not os.path.exists(gpkg_path) or os.path.getsize(gpkg_path) == 0
+    )
     if not is_new_file:
         _warn_on_legacy_tables(gpkg_path)
     written: list[tuple[str, str, str]] = []
@@ -141,7 +145,13 @@ def _warn_on_legacy_tables(gpkg_path: str) -> None:
         from osgeo import ogr  # type: ignore[import-not-found]
     except ImportError:
         return
-    ds = ogr.Open(gpkg_path)
+    # ogr.Open raises RuntimeError on Windows for files that exist but
+    # aren't a recognised driver (empty placeholder, wrong extension);
+    # the warning is purely informational, so swallow and return.
+    try:
+        ds = ogr.Open(gpkg_path)
+    except RuntimeError:
+        return
     if ds is None:
         return
     legacy: list[str] = []
