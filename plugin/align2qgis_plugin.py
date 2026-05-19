@@ -92,7 +92,7 @@ class Align2QgisPlugin:
         )
 
         self.profile_dock = Align2QgisProfileDock(self.iface.mainWindow())
-        self.iface.addDockWidget(Qt.RightDockWidgetArea, self.profile_dock)
+        self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.profile_dock)
         self.profile_dock.hide()
         self.profile_dock.alignmentSelected.connect(self._on_dock_alignment_picked)
 
@@ -351,7 +351,7 @@ class Align2QgisPlugin:
         if preset_path:
             dlg.path_edit.setText(preset_path)
             dlg.crs_edit.setText(default_crs)
-        if dlg.exec_() != QDialog.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
         dlg.persist()
         return dlg.options()

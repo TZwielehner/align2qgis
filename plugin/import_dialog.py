@@ -122,7 +122,7 @@ class Align2QgisImportDialog(QDialog):
         form.addRow("Chainage interval", self.interval_spin)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -151,7 +151,7 @@ class Align2QgisImportDialog(QDialog):
             "Select or create GeoPackage",
             self.gpkg_edit.text(),
             "GeoPackage (*.gpkg)",
-            options=QFileDialog.DontConfirmOverwrite,
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if path:
             if not path.lower().endswith(".gpkg"):
