@@ -13,6 +13,7 @@ together. The actual work is delegated to the focused modules:
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from qgis.PyQt.QtCore import Qt
@@ -24,6 +25,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import (
     Qgis,
+    QgsFeature,
     QgsMapLayer,
     QgsProject,
     QgsVectorLayer,
@@ -32,22 +34,24 @@ from qgis.core import (
 from . import cache
 from .constants import (
     ALIGNMENT_LAYER_PREFIX,
+    CHAINAGE_LABEL_LAYER,
     DIMENSIONS_LAYER_PREFIX,
     PLUGIN_NAME,
     PROP_CRS,
     PROP_SOURCE_PATH,
     SEGMENTS_LAYER_PREFIX,
+    SOURCE_FILE_FIELD,
     STATIONS_LAYER_PREFIX,
 )
 from .gpkg_writer import write_layers_to_gpkg
 from .import_dialog import Align2QgisImportDialog, ImportOptions
-from .landxml_parser import inspect_landxml, parse_alignments
+from .landxml_parser import inspect_landxml, parse_alignments_with_meta
 from .layers import (
     build_alignment_layer,
-    build_chainage_layer,
+    build_chainage_label_layer,
     build_dimension_layer,
     build_segment_layer,
-    safe_name,
+    build_stations_layer,
     tag_layer,
 )
 from .profile_dock import Align2QgisProfileDock
@@ -62,6 +66,13 @@ if TYPE_CHECKING:
 
 
 _SUPPORTED_INSPECT_TAGS = {"Alignment", "Profile"}
+
+# Layer-kind tags used by _apply_styling to pick the right symbology / labels.
+_KIND_ALIGNMENT = "alignment"
+_KIND_SEGMENTS = "segments"
+_KIND_STATIONS = "stations"
+_KIND_DIMENSIONS = "dimensions"
+_KIND_CHAINAGE = "chainage"
 
 
 class Align2QgisPlugin:
@@ -182,32 +193,32 @@ class Align2QgisPlugin:
 
     def _load_alignment_into_dock(self, source_path: str) -> None:
         """Wire the dock's segment + station + vertical-profile state to
-        ``source_path``. Common back-end for the active-layer flow and the
-        combo-box picker.
+        ``source_path``. The Segments / Stations layers are now shared
+        across all imports, so we filter the dock by the cached alignment
+        names for this source path.
         """
         if self.profile_dock is None:
             return
-        seg_layer, stn_layer = self._find_dock_layers(source_path)
+        seg_layer, stn_layer = self._find_dock_layers()
+        alignment_names = [a.name for a in cache.alignments(source_path)]
         self.profile_dock.set_alignment(
             seg_layer,
             vert_profile=cache.vert_samples(source_path),
             title=os.path.basename(source_path),
+            alignment_names=alignment_names,
         )
         self.profile_dock.select_alignment(source_path)
         self._connect_station_layer(stn_layer)
 
-    def _find_dock_layers(
-        self, source_path: str
-    ) -> tuple[QgsVectorLayer | None, QgsVectorLayer | None]:
+    def _find_dock_layers(self) -> tuple[QgsVectorLayer | None, QgsVectorLayer | None]:
+        """Locate the canonical Segments + Stations layers in the project."""
         seg_layer: QgsVectorLayer | None = None
         stn_layer: QgsVectorLayer | None = None
         for ml in QgsProject.instance().mapLayers().values():
-            if ml.customProperty(PROP_SOURCE_PATH, "") != source_path:
-                continue
             name = ml.name()
-            if name.startswith(SEGMENTS_LAYER_PREFIX):
+            if name == SEGMENTS_LAYER_PREFIX:
                 seg_layer = ml
-            elif name.startswith(STATIONS_LAYER_PREFIX):
+            elif name == STATIONS_LAYER_PREFIX:
                 stn_layer = ml
         return seg_layer, stn_layer
 
@@ -357,42 +368,39 @@ class Align2QgisPlugin:
         return dlg.options()
 
     def _process(self, opts: ImportOptions) -> None:
-        alignments = self._parse_or_error(opts.landxml_path)
-        if alignments is None:
+        parsed = self._parse_or_error(opts.landxml_path)
+        if parsed is None:
             return
+        alignments, meta = parsed
 
+        base = os.path.basename(opts.landxml_path)
         replaced = self._purge_existing(opts.landxml_path)
         cache.remember(opts.landxml_path, alignments)
 
-        base = os.path.basename(opts.landxml_path)
-        stem = safe_name(os.path.splitext(base)[0])
-        layers_to_register = self._build_layers(alignments, opts, base, stem)
+        # Build fresh memory layers from this import. Each carries the
+        # source_file column so the per-import purge can find them later.
+        imported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        new_layers = self._build_layers(
+            alignments, opts, base, imported_at, meta,
+        )
 
         project = QgsProject.instance()
-        root = project.layerTreeRoot()
-        group = root.insertGroup(0, base)
-        group.setCustomProperty(PROP_SOURCE_PATH, opts.landxml_path)
-        group.setCustomProperty(PROP_CRS, opts.crs_authid)
-
         try:
-            target = self._register_layers(project, group, layers_to_register, opts)
+            target = self._register_layers(project, new_layers, opts)
         except IOError as exc:
             QMessageBox.critical(
                 self.iface.mainWindow(), PLUGIN_NAME,
                 f"GeoPackage write failed:\n{exc}",
             )
-            root.removeChildNode(group)
             return
 
         self._refresh_dock_combo()
 
-        align_layer = layers_to_register[0][0]
-        n_align = align_layer.featureCount()
-        n_layers = len(layers_to_register)
+        n_align = len(alignments)
         action = "Re-applied" if replaced else "Imported"
         msg = (
             f"{action} {n_align} alignment(s) from {base} → "
-            f"{n_layers} layer(s) ({target})"
+            f"{len(new_layers)} layer(s) ({target})"
         )
         self.iface.messageBar().pushMessage(
             PLUGIN_NAME, msg, level=Qgis.MessageLevel.Info, duration=6
@@ -402,7 +410,7 @@ class Align2QgisPlugin:
         try:
             with open(path, "rb") as fh:
                 xml_bytes = fh.read()
-            alignments = parse_alignments(xml_bytes)
+            alignments, meta = parse_alignments_with_meta(xml_bytes)
         except Exception as exc:  # broad: surface parse errors to user
             QMessageBox.critical(
                 self.iface.mainWindow(), PLUGIN_NAME,
@@ -415,105 +423,191 @@ class Align2QgisPlugin:
                 "No <Alignment> elements found in file.",
             )
             return None
-        return alignments
+        return alignments, meta
 
     def _build_layers(
-        self, alignments, opts: ImportOptions, base: str, stem: str
-    ) -> list[tuple[QgsVectorLayer, str, str]]:
-        """Return ``[(layer, gpkg_name, kind), …]`` for everything to register."""
+        self, alignments, opts: ImportOptions, base: str,
+        imported_at: str, meta,
+    ) -> list[tuple[QgsVectorLayer, str, str, bool]]:
+        """Return ``[(layer, canonical_name, kind, persist_to_gpkg), …]``.
+
+        ``persist_to_gpkg`` is False for the auxiliary in-memory chainage
+        label layer; everything else gets written to the GeoPackage.
+        """
         crs = opts.crs_authid
         tag = lambda layer: tag_layer(layer, opts.landxml_path, crs)  # noqa: E731
 
-        out: list[tuple[QgsVectorLayer, str, str]] = [(
-            tag(build_alignment_layer(alignments, f"{ALIGNMENT_LAYER_PREFIX} — {base}", crs)),
-            f"align_{stem}",
-            "alignment",
+        out: list[tuple[QgsVectorLayer, str, str, bool]] = [(
+            tag(build_alignment_layer(
+                alignments, ALIGNMENT_LAYER_PREFIX, crs,
+                source_file=base, source_path=opts.landxml_path,
+                imported_at=imported_at, metadata=meta,
+            )),
+            ALIGNMENT_LAYER_PREFIX,
+            _KIND_ALIGNMENT,
+            True,
         )]
 
         seg_layer = tag(build_segment_layer(
-            alignments, f"{SEGMENTS_LAYER_PREFIX} — {base}", crs
+            alignments, SEGMENTS_LAYER_PREFIX, crs, source_file=base,
         ))
         if seg_layer.featureCount() > 0:
-            out.append((seg_layer, f"segments_{stem}", "segments"))
+            out.append((seg_layer, SEGMENTS_LAYER_PREFIX, _KIND_SEGMENTS, True))
 
+        # Stations table = defining stations only (segment endpoints + start).
+        stn_layer = tag(build_stations_layer(
+            alignments, STATIONS_LAYER_PREFIX, crs,
+            perpendicular=opts.label_perpendicular,
+            source_file=base,
+        ))
+        if stn_layer.featureCount() > 0:
+            out.append((stn_layer, STATIONS_LAYER_PREFIX, _KIND_STATIONS, True))
+
+        # Interval chainage labels live on a separate in-memory point layer.
         if opts.chainage_interval > 0:
-            stn_layer = tag(build_chainage_layer(
-                alignments,
-                f"{STATIONS_LAYER_PREFIX} ({opts.chainage_interval:g} m) — {base}",
-                crs, opts.chainage_interval,
+            chain_layer = tag(build_chainage_label_layer(
+                alignments, CHAINAGE_LABEL_LAYER, crs, opts.chainage_interval,
                 perpendicular=opts.label_perpendicular,
             ))
-            if stn_layer.featureCount() > 0:
-                out.append((stn_layer, f"stations_{stem}", "chainage"))
+            if chain_layer.featureCount() > 0:
+                out.append((chain_layer, CHAINAGE_LABEL_LAYER, _KIND_CHAINAGE, False))
 
         if opts.create_dimension_layer and (
             opts.dim_arcs or opts.dim_spirals or opts.dim_tangents
         ):
             dim_layer = tag(build_dimension_layer(
-                alignments, f"{DIMENSIONS_LAYER_PREFIX} — {base}", crs,
+                alignments, DIMENSIONS_LAYER_PREFIX, crs,
                 arcs=opts.dim_arcs, spirals=opts.dim_spirals, tangents=opts.dim_tangents,
                 perpendicular=opts.label_perpendicular,
+                source_file=base,
             ))
             if dim_layer.featureCount() > 0:
-                out.append((dim_layer, f"dims_{stem}", "dimensions"))
+                out.append((dim_layer, DIMENSIONS_LAYER_PREFIX, _KIND_DIMENSIONS, True))
 
         return out
 
     def _register_layers(
-        self, project, group, layers_to_register, opts: ImportOptions
+        self, project, new_layers, opts: ImportOptions,
     ) -> str:
-        """Drop everything into the project + group, optionally to GPKG.
+        """Append features into the canonical-named project layers; create
+        them if they don't exist yet. Optionally also persist to GPKG.
 
         Returns a short human label for the destination (used in the
         pushMessage summary).
         """
-        if opts.gpkg_path:
-            pairs = [(layer, name) for layer, name, _ in layers_to_register]
-            written = write_layers_to_gpkg(pairs, opts.gpkg_path)
-            kinds = {gpkg_name: kind for _, gpkg_name, kind in layers_to_register}
-            for gpkg_path, gpkg_name, display in written:
-                gpkg_layer = QgsVectorLayer(
-                    f"{gpkg_path}|layername={gpkg_name}", display, "ogr"
-                )
-                if not gpkg_layer.isValid():
-                    continue
-                tag_layer(gpkg_layer, opts.landxml_path, opts.crs_authid)
-                project.addMapLayer(gpkg_layer, False)
-                group.addLayer(gpkg_layer)
-                self._apply_styling(gpkg_layer, kinds.get(gpkg_name, ""))
-            return opts.gpkg_path
+        root = project.layerTreeRoot()
+        group = root.findGroup(PLUGIN_NAME) or root.insertGroup(0, PLUGIN_NAME)
 
-        for layer, _, kind in layers_to_register:
-            project.addMapLayer(layer, False)
-            group.addLayer(layer)
-            self._apply_styling(layer, kind)
-        return "in-memory layers"
+        if opts.gpkg_path:
+            persisted = [
+                (layer, name) for layer, name, _, persist in new_layers if persist
+            ]
+            base = os.path.basename(opts.landxml_path)
+            write_layers_to_gpkg(persisted, opts.gpkg_path, source_file=base)
+
+        for layer, name, kind, persist in new_layers:
+            existing = self._find_named_layer(project, name)
+            if existing is None:
+                if persist and opts.gpkg_path:
+                    gpkg_layer = QgsVectorLayer(
+                        f"{opts.gpkg_path}|layername={name}", name, "ogr"
+                    )
+                    if gpkg_layer.isValid():
+                        tag_layer(gpkg_layer, opts.landxml_path, opts.crs_authid)
+                        project.addMapLayer(gpkg_layer, False)
+                        group.addLayer(gpkg_layer)
+                        self._apply_styling(gpkg_layer, kind, opts)
+                        continue
+                project.addMapLayer(layer, False)
+                group.addLayer(layer)
+                self._apply_styling(layer, kind, opts)
+            else:
+                # Layer already exists in project — append the freshly-built
+                # features into it. Memory layers and GPKG-backed layers both
+                # support dataProvider().addFeatures().
+                self._append_features(existing, layer)
+                self._apply_styling(existing, kind, opts)
+
+        return opts.gpkg_path or "in-memory layers"
 
     @staticmethod
-    def _apply_styling(layer: QgsVectorLayer, kind: str) -> None:
-        if kind == "chainage":
+    def _find_named_layer(project, name: str) -> QgsVectorLayer | None:
+        for ml in project.mapLayers().values():
+            if isinstance(ml, QgsVectorLayer) and ml.name() == name:
+                return ml
+        return None
+
+    @staticmethod
+    def _append_features(target: QgsVectorLayer, source: QgsVectorLayer) -> None:
+        """Copy every feature from ``source`` into ``target`` by attribute
+        name. Field set differences are tolerated — missing fields stay NULL.
+        """
+        target_fields = target.fields()
+        src_fields = source.fields()
+        new_feats: list[QgsFeature] = []
+        for sf in source.getFeatures():
+            nf = QgsFeature(target_fields)
+            nf.setGeometry(sf.geometry())
+            for i in range(target_fields.count()):
+                fname = target_fields.at(i).name()
+                src_idx = src_fields.indexOf(fname)
+                if src_idx >= 0:
+                    nf.setAttribute(i, sf.attribute(src_idx))
+            new_feats.append(nf)
+        if not new_feats:
+            return
+        was_editing = target.isEditable()
+        if not was_editing:
+            target.startEditing()
+        target.dataProvider().addFeatures(new_feats)
+        if not was_editing:
+            target.commitChanges()
+        target.updateExtents()
+        target.triggerRepaint()
+
+    @staticmethod
+    def _apply_styling(layer: QgsVectorLayer, kind: str, opts: ImportOptions) -> None:
+        if kind in (_KIND_STATIONS, _KIND_CHAINAGE):
             apply_station_labels(layer)
             apply_station_symbol(layer)
-        elif kind == "dimensions":
+        elif kind == _KIND_DIMENSIONS:
             apply_dimension_labels(layer)
 
     def _purge_existing(self, source_path: str) -> int:
-        """Remove every plugin-managed layer + its group whose source
-        matches ``source_path``. Keeps :meth:`_process` idempotent so
-        Re-apply replaces instead of stacking duplicates.
+        """Delete rows whose ``source_file`` matches ``source_path``'s basename
+        from each canonical-named layer in the project. Idempotent: missing
+        layers are skipped silently.
+
+        Returns the number of layers from which rows were deleted.
         """
         project = QgsProject.instance()
-        victims = [
-            layer.id()
-            for layer in project.mapLayers().values()
-            if layer.customProperty(PROP_SOURCE_PATH, "") == source_path
-        ]
-        for layer_id in victims:
-            project.removeMapLayer(layer_id)
-
-        root = project.layerTreeRoot()
-        for grp in list(root.findGroups()):
-            if grp.customProperty(PROP_SOURCE_PATH, "") == source_path:
-                root.removeChildNode(grp)
+        base = os.path.basename(source_path)
+        touched = 0
+        for layer_name in (
+            ALIGNMENT_LAYER_PREFIX, SEGMENTS_LAYER_PREFIX,
+            STATIONS_LAYER_PREFIX, DIMENSIONS_LAYER_PREFIX,
+            CHAINAGE_LABEL_LAYER,
+        ):
+            layer = self._find_named_layer(project, layer_name)
+            if layer is None:
+                continue
+            field_idx = layer.fields().indexOf(SOURCE_FILE_FIELD)
+            if field_idx < 0:
+                continue
+            victims = [
+                f.id() for f in layer.getFeatures()
+                if f.attribute(field_idx) == base
+            ]
+            if not victims:
+                continue
+            was_editing = layer.isEditable()
+            if not was_editing:
+                layer.startEditing()
+            layer.dataProvider().deleteFeatures(victims)
+            if not was_editing:
+                layer.commitChanges()
+            layer.updateExtents()
+            layer.triggerRepaint()
+            touched += 1
         cache.forget(source_path)
-        return len(victims)
+        return touched

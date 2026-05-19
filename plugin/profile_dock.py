@@ -159,13 +159,24 @@ class Align2QgisProfileDock(QDockWidget):
         segments_layer: QgsVectorLayer | None,
         vert_profile: list[tuple[float, float]] | None = None,
         title: str = "",
+        alignment_names: list[str] | None = None,
     ) -> None:
-        """Populate from a ``segments_<stem>`` layer + optional vertical profile."""
+        """Populate from the shared ``Segments`` layer + optional vertical profile.
+
+        Under the canonical-schema model, the ``Segments`` layer holds rows
+        from every import. ``alignment_names`` filters to just the ones
+        belonging to the currently-selected source file. ``None`` = no filter
+        (legacy single-file behaviour).
+        """
         self._segments = []
         self._title = title
+        wanted = set(alignment_names) if alignment_names is not None else None
         if segments_layer is not None and segments_layer.isValid():
             for feat in segments_layer.getFeatures():
                 try:
+                    if wanted is not None:
+                        if str(feat["alignment"]) not in wanted:
+                            continue
                     seg = _Segment(
                         kind=str(feat["kind"]),
                         sta_start=_safe_float(feat["sta_start"]),

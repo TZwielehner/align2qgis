@@ -22,7 +22,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from .constants import PROP_CRS, PROP_SOURCE_PATH
+from .constants import PROP_CRS, PROP_SOURCE_PATH, SOURCE_FILE_FIELD
 from .dimensions import build_dimensions
 from .geometry_builder import (
     alignment_chainage,
@@ -31,7 +31,7 @@ from .geometry_builder import (
     segment_length,
     segment_points,
 )
-from .landxml_parser import CurveSeg, SpiralSeg
+from .landxml_parser import CurveSeg, LandXMLMetadata, SpiralSeg
 from .stationing import format_station, upright_bearing
 
 
@@ -69,19 +69,20 @@ def _new_memory_layer(
 # Builders
 # ---------------------------------------------------------------------------
 def build_alignment_layer(
-    alignments, layer_name: str, crs_authid: str
+    alignments,
+    layer_name: str,
+    crs_authid: str,
+    *,
+    source_file: str = "",
+    source_path: str = "",
+    imported_at: str = "",
+    metadata: LandXMLMetadata | None = None,
 ) -> QgsVectorLayer:
     """One polyline feature per alignment — the rendered horizontal curve."""
     layer = _new_memory_layer(
-        layer_name, crs_authid, "LineString",
-        [
-            QgsField("name", QMetaType.Type.QString),
-            QgsField("length_xml", QMetaType.Type.Double),
-            QgsField("length_geom", QMetaType.Type.Double),
-            QgsField("sta_start", QMetaType.Type.Double),
-            QgsField("n_segments", QMetaType.Type.Int),
-        ],
+        layer_name, crs_authid, "LineString", alignment_fields(),
     )
+    meta = metadata or LandXMLMetadata()
 
     features: list[QgsFeature] = []
     for alignment in alignments:
@@ -96,6 +97,12 @@ def build_alignment_layer(
         feat.setAttribute("length_geom", geom.length())
         feat.setAttribute("sta_start", alignment.sta_start)
         feat.setAttribute("n_segments", len(alignment.segments))
+        feat.setAttribute(SOURCE_FILE_FIELD, source_file)
+        feat.setAttribute("source_path", source_path)
+        feat.setAttribute("imported_at", imported_at)
+        feat.setAttribute("landxml_version", meta.landxml_version)
+        feat.setAttribute("project_name", meta.project_name)
+        feat.setAttribute("track_number", alignment.track_number)
         features.append(feat)
 
     layer.dataProvider().addFeatures(features)
@@ -103,28 +110,52 @@ def build_alignment_layer(
     return layer
 
 
+def alignment_fields() -> list[QgsField]:
+    return [
+        QgsField("name", QMetaType.Type.QString),
+        QgsField("length_xml", QMetaType.Type.Double),
+        QgsField("length_geom", QMetaType.Type.Double),
+        QgsField("sta_start", QMetaType.Type.Double),
+        QgsField("n_segments", QMetaType.Type.Int),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+        QgsField("source_path", QMetaType.Type.QString),
+        QgsField("imported_at", QMetaType.Type.QString),
+        QgsField("landxml_version", QMetaType.Type.QString),
+        QgsField("project_name", QMetaType.Type.QString),
+        QgsField("track_number", QMetaType.Type.QString),
+    ]
+
+
+def segment_fields() -> list[QgsField]:
+    return [
+        QgsField("alignment", QMetaType.Type.QString),
+        QgsField("seg_index", QMetaType.Type.Int),
+        QgsField("kind", QMetaType.Type.QString),
+        QgsField("transition_type", QMetaType.Type.QString),
+        QgsField("length", QMetaType.Type.Double),
+        QgsField("radius_start", QMetaType.Type.Double),
+        QgsField("radius_end", QMetaType.Type.Double),
+        QgsField("curvature_start", QMetaType.Type.Double),
+        QgsField("curvature_end", QMetaType.Type.Double),
+        QgsField("spiral_a", QMetaType.Type.Double),
+        QgsField("sta_start", QMetaType.Type.Double),
+        QgsField("sta_end", QMetaType.Type.Double),
+        QgsField("rot", QMetaType.Type.QString),
+        QgsField("desc", QMetaType.Type.QString),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+    ]
+
+
 def build_segment_layer(
-    alignments, layer_name: str, crs_authid: str
+    alignments,
+    layer_name: str,
+    crs_authid: str,
+    *,
+    source_file: str = "",
 ) -> QgsVectorLayer:
     """One polyline feature per LandXML segment (Line / Curve / Spiral)."""
     layer = _new_memory_layer(
-        layer_name, crs_authid, "LineString",
-        [
-            QgsField("alignment", QMetaType.Type.QString),
-            QgsField("seg_index", QMetaType.Type.Int),
-            QgsField("kind", QMetaType.Type.QString),
-            QgsField("transition_type", QMetaType.Type.QString),
-            QgsField("length", QMetaType.Type.Double),
-            QgsField("radius_start", QMetaType.Type.Double),
-            QgsField("radius_end", QMetaType.Type.Double),
-            QgsField("curvature_start", QMetaType.Type.Double),
-            QgsField("curvature_end", QMetaType.Type.Double),
-            QgsField("spiral_a", QMetaType.Type.Double),
-            QgsField("sta_start", QMetaType.Type.Double),
-            QgsField("sta_end", QMetaType.Type.Double),
-            QgsField("rot", QMetaType.Type.QString),
-            QgsField("desc", QMetaType.Type.QString),
-        ],
+        layer_name, crs_authid, "LineString", segment_fields(),
     )
 
     features: list[QgsFeature] = []
@@ -174,6 +205,7 @@ def build_segment_layer(
             feat.setAttribute("sta_end", sta + length)
             feat.setAttribute("rot", rot)
             feat.setAttribute("desc", getattr(seg, "desc", None) or "")
+            feat.setAttribute(SOURCE_FILE_FIELD, source_file)
             features.append(feat)
             sta += length
 
@@ -182,40 +214,47 @@ def build_segment_layer(
     return layer
 
 
-def build_chainage_layer(
+def stations_fields() -> list[QgsField]:
+    return [
+        QgsField("alignment", QMetaType.Type.QString),
+        QgsField("station", QMetaType.Type.Double),
+        QgsField("label", QMetaType.Type.QString),
+        QgsField("rotation", QMetaType.Type.Double),
+        QgsField("rotation_perp", QMetaType.Type.Double),
+        QgsField("seg_index", QMetaType.Type.Int),
+        QgsField("seg_kind", QMetaType.Type.QString),
+        QgsField("transition_type", QMetaType.Type.QString),
+        QgsField("curvature", QMetaType.Type.Double),
+        QgsField("radius", QMetaType.Type.Double),
+        QgsField("desc", QMetaType.Type.QString),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+    ]
+
+
+def build_stations_layer(
     alignments,
     layer_name: str,
     crs_authid: str,
-    interval: float,
+    *,
     perpendicular: bool = False,
+    source_file: str = "",
 ) -> QgsVectorLayer:
-    """One point feature per round chainage station."""
-    layer = _new_memory_layer(
-        layer_name, crs_authid, "Point",
-        [
-            QgsField("alignment", QMetaType.Type.QString),
-            QgsField("station", QMetaType.Type.Double),
-            QgsField("label", QMetaType.Type.QString),
-            QgsField("rotation", QMetaType.Type.Double),
-            QgsField("rotation_perp", QMetaType.Type.Double),
-            QgsField("seg_index", QMetaType.Type.Int),
-            QgsField("seg_kind", QMetaType.Type.QString),
-            QgsField("transition_type", QMetaType.Type.QString),
-            QgsField("curvature", QMetaType.Type.Double),
-            QgsField("radius", QMetaType.Type.Double),
-            QgsField("desc", QMetaType.Type.QString),
-            QgsField("is_endpoint", QMetaType.Type.Bool),
-        ],
-    )
+    """Defining stations only — alignment start + every segment endpoint.
+
+    Annotation stations at fixed intervals belong on the Alignments layer's
+    label engine (see :func:`build_chainage_label_layer` for the auxiliary
+    in-memory layer that backs them when symbol-level labeling is wanted).
+    """
+    layer = _new_memory_layer(layer_name, crs_authid, "Point", stations_fields())
 
     label_offset = 90.0 if perpendicular else 0.0
     features: list[QgsFeature] = []
     for alignment in alignments:
-        stations = alignment_chainage(alignment, interval, include_endpoints=True)
+        # interval=0 emits only segment endpoints + alignment start.
+        stations = alignment_chainage(alignment, 0.0, include_endpoints=True)
         if not stations:
             continue
-        last_idx = len(stations) - 1
-        for i, cp in enumerate(stations):
+        for cp in stations:
             feat = QgsFeature(layer.fields())
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
             feat.setAttribute("alignment", alignment.name)
@@ -236,12 +275,75 @@ def build_chainage_layer(
             feat.setAttribute("curvature", cp.curvature)
             feat.setAttribute("radius", cp.radius)
             feat.setAttribute("desc", cp.desc)
-            feat.setAttribute("is_endpoint", i == 0 or i == last_idx)
+            feat.setAttribute(SOURCE_FILE_FIELD, source_file)
             features.append(feat)
 
     layer.dataProvider().addFeatures(features)
     layer.updateExtents()
     return layer
+
+
+def build_chainage_label_layer(
+    alignments,
+    layer_name: str,
+    crs_authid: str,
+    interval: float,
+    *,
+    perpendicular: bool = False,
+) -> QgsVectorLayer:
+    """In-memory-only points every ``interval`` metres along each alignment.
+
+    Carries the same schema as the Stations layer so the existing station
+    label/tick styling applies unchanged. Not written to the GeoPackage —
+    rebuilt on every import alongside the persisted Alignments table.
+    """
+    layer = _new_memory_layer(layer_name, crs_authid, "Point", stations_fields())
+
+    label_offset = 90.0 if perpendicular else 0.0
+    features: list[QgsFeature] = []
+    for alignment in alignments:
+        stations = alignment_chainage(alignment, interval, include_endpoints=False)
+        for cp in stations:
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
+            feat.setAttribute("alignment", alignment.name)
+            feat.setAttribute("station", cp.station)
+            feat.setAttribute("label", format_station(cp.station))
+            feat.setAttribute(
+                "rotation", upright_bearing(-(cp.bearing_deg + label_offset))
+            )
+            feat.setAttribute(
+                "rotation_perp", upright_bearing(-(cp.bearing_deg + 90.0))
+            )
+            feat.setAttribute("seg_index", cp.seg_index)
+            feat.setAttribute("seg_kind", cp.seg_kind)
+            feat.setAttribute("transition_type", cp.transition_type)
+            feat.setAttribute("curvature", cp.curvature)
+            feat.setAttribute("radius", cp.radius)
+            feat.setAttribute("desc", cp.desc)
+            features.append(feat)
+
+    layer.dataProvider().addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+# Back-compat alias — old callers and tests still reach for build_chainage_layer.
+build_chainage_layer = build_chainage_label_layer
+
+
+def dimension_fields() -> list[QgsField]:
+    return [
+        QgsField("alignment", QMetaType.Type.QString),
+        QgsField("seg_index", QMetaType.Type.Int),
+        QgsField("kind", QMetaType.Type.QString),
+        QgsField("label", QMetaType.Type.QString),
+        QgsField("rotation", QMetaType.Type.Double),
+        QgsField("radius", QMetaType.Type.Double),
+        QgsField("spiral_a", QMetaType.Type.Double),
+        QgsField("seg_length", QMetaType.Type.Double),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+    ]
 
 
 def build_dimension_layer(
@@ -253,21 +355,10 @@ def build_dimension_layer(
     spirals: bool,
     tangents: bool,
     perpendicular: bool = False,
+    source_file: str = "",
 ) -> QgsVectorLayer:
     """One point feature per dimensionable segment (R=… arcs, A=… spirals)."""
-    layer = _new_memory_layer(
-        layer_name, crs_authid, "Point",
-        [
-            QgsField("alignment", QMetaType.Type.QString),
-            QgsField("seg_index", QMetaType.Type.Int),
-            QgsField("kind", QMetaType.Type.QString),
-            QgsField("label", QMetaType.Type.QString),
-            QgsField("rotation", QMetaType.Type.Double),
-            QgsField("radius", QMetaType.Type.Double),
-            QgsField("spiral_a", QMetaType.Type.Double),
-            QgsField("seg_length", QMetaType.Type.Double),
-        ],
-    )
+    layer = _new_memory_layer(layer_name, crs_authid, "Point", dimension_fields())
 
     label_offset = 90.0 if perpendicular else 0.0
     features: list[QgsFeature] = []
@@ -287,6 +378,7 @@ def build_dimension_layer(
             feat.setAttribute("radius", d.radius)
             feat.setAttribute("spiral_a", d.spiral_a)
             feat.setAttribute("seg_length", d.seg_length)
+            feat.setAttribute(SOURCE_FILE_FIELD, source_file)
             features.append(feat)
 
     layer.dataProvider().addFeatures(features)

@@ -7,6 +7,7 @@ when emitting QgsPointXY — this module preserves the raw LandXML order in
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -133,6 +134,17 @@ class Alignment:
     sta_start: float | None
     segments: list[Segment] = field(default_factory=list)
     profile: Profile | None = None  # vertical profile (`<Profile>` child), if present
+    # Best-effort track number lifted from <Feature name="...track..."> children
+    # of <Alignment>; falls back to a 3-5 digit run found in the alignment name.
+    track_number: str | None = None
+
+
+@dataclass
+class LandXMLMetadata:
+    """Header-level info needed for the Alignments table's source columns."""
+
+    project_name: str | None = None
+    landxml_version: str | None = None
 
 
 def _parse_radius(text: str | None) -> float | None:
@@ -382,18 +394,60 @@ def inspect_landxml(source: str | bytes) -> dict[str, int]:
     return counts
 
 
+_TRACK_NUM_RE = re.compile(r"\b\d{3,5}\b")
+
+
+def _extract_track_number(alignment_elem: ET.Element, alignment_name: str) -> str | None:
+    """Best-effort track number lookup. <Feature name="…track…"> wins; else
+    fall back to the first 3-5 digit run in the alignment name.
+    """
+    for child in alignment_elem:
+        if _strip_ns(child.tag) != "Feature":
+            continue
+        feat_name = (child.attrib.get("name") or "").lower()
+        if "track" not in feat_name:
+            continue
+        value = child.attrib.get("code") or child.attrib.get("value")
+        if value:
+            return value.strip()
+    m = _TRACK_NUM_RE.search(alignment_name or "")
+    return m.group(0) if m else None
+
+
+def _root_from_source(source: str | bytes) -> ET.Element:
+    if isinstance(source, (bytes, bytearray)):
+        return ET.fromstring(source)  # nosec B314 — defusedxml preferred, see import
+    try:
+        return ET.parse(source).getroot()  # nosec B314
+    except (OSError, FileNotFoundError):
+        return ET.fromstring(source)  # nosec B314
+
+
+def _parse_metadata(root: ET.Element) -> LandXMLMetadata:
+    version = root.attrib.get("version") if _strip_ns(root.tag) == "LandXML" else None
+    project_name: str | None = None
+    for child in root:
+        if _strip_ns(child.tag) == "Project":
+            project_name = child.attrib.get("name") or None
+            break
+    return LandXMLMetadata(project_name=project_name, landxml_version=version)
+
+
 def parse_alignments(source: str | bytes) -> list[Alignment]:
     """Parse a LandXML file path, bytes, or string and return alignments.
 
     Accepts both real file paths and in-memory XML for testability.
     """
-    if isinstance(source, (bytes, bytearray)):
-        root = ET.fromstring(source)  # nosec B314 — defusedxml preferred, see import
-    else:
-        try:
-            root = ET.parse(source).getroot()  # nosec B314
-        except (OSError, FileNotFoundError):
-            root = ET.fromstring(source)  # nosec B314
+    alignments, _ = parse_alignments_with_meta(source)
+    return alignments
+
+
+def parse_alignments_with_meta(
+    source: str | bytes,
+) -> tuple[list[Alignment], LandXMLMetadata]:
+    """Same as :func:`parse_alignments` but also returns header metadata."""
+    root = _root_from_source(source)
+    meta = _parse_metadata(root)
 
     alignments: list[Alignment] = []
     for alignments_node in root.iter():
@@ -415,6 +469,7 @@ def parse_alignments(source: str | bytes) -> list[Alignment]:
                 sta_start=float(sta_attr) if sta_attr else None,
                 segments=segments,
                 profile=profile,
+                track_number=_extract_track_number(alignments_node, name),
             )
         )
-    return alignments
+    return alignments, meta

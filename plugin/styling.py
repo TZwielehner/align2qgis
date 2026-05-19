@@ -26,6 +26,54 @@ def apply_dimension_labels(layer: QgsVectorLayer) -> None:
     )
 
 
+# Strategy: the plugin renders interval chainage labels off an auxiliary
+# in-memory point layer (see build_chainage_label_layer) rather than driving
+# them off the Alignments line itself. The line-only path below is kept for
+# callers that want labels without the helper layer — repeat distance is in
+# mm so 50 m on a metric CRS map becomes 50000 mm.
+def apply_alignment_chainage_labels(layer: QgsVectorLayer, interval_m: float) -> None:
+    """Rule-based labels along an Alignments line every ``interval_m`` metres.
+
+    Uses ``QgsPalLayerSettings.Line`` placement with a repeat distance — the
+    label text is the alignment name; QGIS handles the spacing. Running
+    chainage values are not displayed here (no clean per-repeat distance
+    expression in PAL); use ``build_chainage_label_layer`` + the existing
+    station styling when you need "km 0+050" style labels.
+    """
+    try:
+        from qgis.core import (
+            QgsPalLayerSettings,
+            QgsTextFormat,
+            QgsVectorLayerSimpleLabeling,
+        )
+        from qgis.PyQt.QtGui import QColor, QFont
+        from qgis.PyQt.QtWidgets import QApplication
+    except Exception as exc:  # pragma: no cover
+        print(f"[align2qgis] alignment chainage labels skipped: {exc}")
+        return
+
+    text = QgsTextFormat()
+    font = QFont(QApplication.font())
+    font.setPointSize(7)
+    text.setFont(font)
+    text.setColor(QColor(60, 60, 60))
+
+    pal = QgsPalLayerSettings()
+    pal.fieldName = "name"
+    pal.enabled = True
+    pal.setFormat(text)
+    try:
+        placement = getattr(QgsPalLayerSettings, "Placement", QgsPalLayerSettings)
+        pal.placement = getattr(placement, "Line", QgsPalLayerSettings.Line)
+    except (AttributeError, TypeError) as exc:
+        print(f"[align2qgis] alignment label placement skipped: {exc}")
+    # Repeat distance is in millimetres for screen-space PAL.
+    pal.repeatDistance = max(1.0, interval_m) * 1000.0
+
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    layer.setLabelsEnabled(True)
+
+
 def apply_station_symbol(layer: QgsVectorLayer) -> None:
     """Render each chainage point as a short tick perpendicular to the
     alignment, driven by the layer's ``rotation_perp`` field.

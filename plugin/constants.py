@@ -20,3 +20,11 @@ ALIGNMENT_LAYER_PREFIX = "Alignments"
 SEGMENTS_LAYER_PREFIX = "Segments"
 STATIONS_LAYER_PREFIX = "Stations"
 DIMENSIONS_LAYER_PREFIX = "Dimensions"
+
+# In-memory only — interval chainage labels along the Alignments layer.
+# Not persisted to the GeoPackage; rebuilt on every import.
+CHAINAGE_LABEL_LAYER = "Chainage (interval)"
+
+# Column that distinguishes rows from different LandXML imports inside the
+# shared canonical tables. Re-import semantics delete-by-source then append.
+SOURCE_FILE_FIELD = "source_file"
