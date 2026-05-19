@@ -24,6 +24,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import (
     Qgis,
+    QgsApplication,
     QgsFeature,
     QgsMapLayer,
     QgsProject,
@@ -45,6 +46,7 @@ from .constants import (
 )
 from .gpkg_writer import write_layers_to_gpkg
 from .import_dialog import Align2QgisImportDialog, ImportOptions
+from .processing.provider import Align2QgisProvider
 from .landxml_parser import inspect_landxml, parse_alignments_with_meta, parse_cross_sections
 from .layers import (
     build_alignment_layer,
@@ -88,6 +90,7 @@ class Align2QgisPlugin:
         self.profile_action: QAction | None = None
         self.profile_dock: Align2QgisProfileDock | None = None
         self._dock_station_layer: QgsVectorLayer | None = None
+        self.provider: Align2QgisProvider | None = None
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -119,12 +122,20 @@ class Align2QgisPlugin:
 
         self.iface.currentLayerChanged.connect(self._on_active_layer_changed)
 
+        # Processing provider — registers Station-from-point and the inverse
+        # in the Processing Toolbox under an "Align2QGIS" group.
+        self.provider = Align2QgisProvider()
+        QgsApplication.processingRegistry().addProvider(self.provider)
+
     def unload(self) -> None:
         try:
             self.iface.currentLayerChanged.disconnect(self._on_active_layer_changed)
         except (TypeError, RuntimeError):
             pass
         self._disconnect_station_layer()
+        if self.provider is not None:
+            QgsApplication.processingRegistry().removeProvider(self.provider)
+            self.provider = None
         if self.profile_dock is not None:
             self.iface.removeDockWidget(self.profile_dock)
             self.profile_dock.deleteLater()

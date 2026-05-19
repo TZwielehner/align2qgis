@@ -60,6 +60,24 @@ under QGIS 4's stricter SIP bindings.
    `<Alignment>`. Attributes: `name`, `length_xml`, `length_geom`,
    `sta_start`, `n_segments`.
 
+## Processing Toolbox
+
+Under *Processing Toolbox → Align2QGIS*:
+
+- **Station from point** — project an external point layer onto the
+  alignment and emit `(alignment_name, station, offset_signed, side)`
+  per input feature. Offset is signed left-positive of the
+  chainage-increasing direction. Skips points whose projection
+  exceeds the configurable maximum offset.
+- **Point from station and offset** — inverse direction: read a table
+  with `alignment_name`, `station`, `offset` and place a point at the
+  resolved map location. Z comes from the LandXML `<Profile>` when
+  the source alignment carries one; offset is planar only.
+
+Both algorithms read the original LandXML behind the Alignments layer
+(via its `align2qgis/source_path` custom property) so projection is
+spiral-aware rather than running against the rendered chord polyline.
+
 ## CLI sanity-check (no QGIS required)
 
 `tools/dump_alignment.py` parses a LandXML file and prints `COMPOUNDCURVE`
