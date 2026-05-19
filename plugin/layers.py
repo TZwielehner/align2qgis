@@ -269,6 +269,7 @@ def stations_fields() -> list[QgsField]:
     return [
         QgsField("alignment", QMetaType.Type.QString),
         QgsField("station", QMetaType.Type.Double),
+        QgsField("station_internal", QMetaType.Type.Double),
         QgsField("label", QMetaType.Type.QString),
         QgsField("rotation", QMetaType.Type.Double),
         QgsField("rotation_perp", QMetaType.Type.Double),
@@ -310,6 +311,7 @@ def build_stations_layer(
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
             feat.setAttribute("alignment", alignment.name)
             feat.setAttribute("station", cp.station)
+            feat.setAttribute("station_internal", cp.station_internal)
             feat.setAttribute("label", format_station(cp.station))
             # QGIS rotation is CW in screen space; our bearing is math CCW
             # in map space (y-up). Negate so labels/markers align with the
@@ -359,6 +361,7 @@ def build_chainage_label_layer(
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
             feat.setAttribute("alignment", alignment.name)
             feat.setAttribute("station", cp.station)
+            feat.setAttribute("station_internal", cp.station_internal)
             feat.setAttribute("label", format_station(cp.station))
             feat.setAttribute(
                 "rotation", upright_bearing(-(cp.bearing_deg + label_offset))

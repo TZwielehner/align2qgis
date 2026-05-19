@@ -10,7 +10,14 @@ import math
 from dataclasses import dataclass
 from typing import Iterable
 
-from .landxml_parser import Alignment, CurveSeg, LineSeg, Segment, SpiralSeg
+from .landxml_parser import (
+    Alignment,
+    CurveSeg,
+    LineSeg,
+    Segment,
+    SpiralSeg,
+    StaEquation,
+)
 
 
 XY = tuple[float, float]
@@ -531,6 +538,11 @@ class ChainagePoint:
     (and to GeoPackage columns when the plugin persists results). Together
     they let the user style by curvature, segment kind, transition type, or
     any free-text ``desc`` from the source file.
+
+    ``station`` is the *displayed* station (LandXML semantics, with station
+    equations applied). ``station_internal`` is the continuous arclength
+    coordinate from the alignment start — equal to ``station`` for
+    alignments without ``<StaEquation>`` children.
     """
 
     station: float
@@ -543,6 +555,75 @@ class ChainagePoint:
     curvature: float       # 1/m, signed (positive = CCW turning)
     radius: float | None   # signed metres; None when curvature is ~0
     desc: str              # passthrough of the segment's LandXML ``desc``
+    station_internal: float = 0.0  # continuous arclength coord (no equations applied)
+
+
+# ---------------------------------------------------------------------------
+# Station equations — internal arclength ↔ displayed station mapping.
+#
+# Internal station = ``alignment.sta_start + arclength_from_start``. Display
+# station = internal + sum of ``(sta_ahead - sta_internal)`` jumps for every
+# equation whose ``sta_internal`` lies at or before the internal position.
+# The equation map is a piecewise-constant offset function on the internal
+# axis with discontinuities at each equation point; inverting it can yield
+# either ``None`` (forward equation: a gap in the display axis) or the
+# "before" branch's value (backward equation: overlap zone is ambiguous;
+# returning the chronologically-earlier interpretation keeps the geometry
+# coherent and matches surveyor convention).
+# ---------------------------------------------------------------------------
+def _equation_segments(
+    alignment: Alignment,
+) -> list[tuple[float, float, float]]:
+    """Return ``[(internal_lo, internal_hi, display_offset), …]`` covering the real line.
+
+    Each segment is a maximal interval of internal stations sharing the
+    same constant display offset. With no equations the result is a single
+    span ``(-∞, +∞)`` at offset 0.
+    """
+    eqs = sorted(alignment.equations, key=lambda e: e.sta_internal)
+    if not eqs:
+        return [(-math.inf, math.inf, 0.0)]
+    segs: list[tuple[float, float, float]] = []
+    prev = -math.inf
+    offset = 0.0
+    for eq in eqs:
+        segs.append((prev, eq.sta_internal, offset))
+        offset += eq.sta_ahead - eq.sta_internal
+        prev = eq.sta_internal
+    segs.append((prev, math.inf, offset))
+    return segs
+
+
+def internal_to_display(alignment: Alignment, s_internal: float) -> float:
+    """Map an internal station to its displayed value via the equation map.
+
+    Returns ``s_internal`` unchanged when the alignment has no equations.
+    Equation points themselves resolve to the "before" branch (display
+    ``sta_back``), matching the convention that the equation applies *after*
+    its internal coordinate.
+    """
+    for lo, hi, off in _equation_segments(alignment):
+        if lo - 1e-9 <= s_internal <= hi + 1e-9:
+            return s_internal + off
+    return s_internal
+
+
+def display_to_internal(
+    alignment: Alignment, s_display: float,
+) -> float | None:
+    """Inverse of :func:`internal_to_display`.
+
+    Returns ``None`` when ``s_display`` falls in a forward equation's gap.
+    For backward equations the display segments overlap; we return the
+    first (chronologically earliest) internal value so an offset table
+    indexed by display station resolves to the upstream interpretation.
+    """
+    for lo, hi, off in _equation_segments(alignment):
+        d_lo = (lo + off) if lo != -math.inf else -math.inf
+        d_hi = (hi + off) if hi != math.inf else math.inf
+        if d_lo - 1e-9 <= s_display <= d_hi + 1e-9:
+            return s_display - off
+    return None
 
 
 def _locate_walker(cum: list[float], s: float) -> int:
@@ -637,7 +718,12 @@ def alignment_xy_at_station(
     if total <= 0:
         return None
     sta_start = alignment.sta_start or 0.0
-    s = station - sta_start
+    # ``station`` is a displayed value — convert through the equation map
+    # to the alignment-internal arclength coordinate first.
+    internal = display_to_internal(alignment, station)
+    if internal is None:
+        return None
+    s = internal - sta_start
     if s < -1e-6 or s > total + 1e-6:
         return None
     if s >= total:
@@ -677,10 +763,11 @@ def alignment_chainage(
         return []
 
     sta_start = alignment.sta_start or 0.0
-    sta_end = sta_start + total
+    sta_internal_end = sta_start + total
+    sta_display_end = internal_to_display(alignment, sta_internal_end)
 
-    def sample(station: float) -> ChainagePoint | None:
-        s = station - sta_start
+    def sample(internal_station: float, display_station: float) -> ChainagePoint | None:
+        s = internal_station - sta_start
         if s < -1e-9 or s > total + 1e-9:
             return None
         if s >= total:
@@ -696,7 +783,7 @@ def alignment_chainage(
             k = k0 + (k1 - k0) * t
         radius = (1.0 / k) if abs(k) > 1e-12 else None
         return ChainagePoint(
-            station=station,
+            station=display_station,
             x=x,
             y=y,
             bearing_deg=bearing,
@@ -706,27 +793,51 @@ def alignment_chainage(
             curvature=k,
             radius=radius,
             desc=desc,
+            station_internal=internal_station,
         )
 
     out: list[ChainagePoint] = []
     if include_endpoints:
-        cp = sample(sta_start)
+        cp = sample(sta_start, sta_start)
         if cp is not None:
             out.append(cp)
 
-    first = math.ceil(sta_start / interval) * interval
-    if first <= sta_start + 1e-9:
-        first += interval
-
-    station = first
-    while station < sta_end - 1e-9:
-        cp = sample(station)
-        if cp is not None:
-            out.append(cp)
-        station += interval
+    # Walk each segment of the equation map separately so round stations
+    # land on multiples of ``interval`` in the *displayed* axis on each
+    # side of every equation discontinuity. Each equation point itself is
+    # emitted as an explicit station marker (display = sta_back, the
+    # "before" branch) so surveyors see the equation in the layer.
+    segments = _equation_segments(alignment)
+    for idx, (lo_int, hi_int, offset) in enumerate(segments):
+        sub_lo = max(lo_int, sta_start)
+        sub_hi = min(hi_int, sta_internal_end)
+        if sub_lo > sub_hi - 1e-9:
+            continue
+        disp_lo = sub_lo + offset
+        disp_hi = sub_hi + offset
+        first = math.ceil(disp_lo / interval) * interval
+        if first <= disp_lo + 1e-9:
+            first += interval
+        sta_disp = first
+        while sta_disp < disp_hi - 1e-9:
+            cp = sample(sta_disp - offset, sta_disp)
+            if cp is not None:
+                out.append(cp)
+            sta_disp += interval
+        # If this segment ends at an equation point that's not the alignment
+        # end, emit it explicitly. ``disp_hi`` is the display value at the
+        # equation's "before" branch (= sta_back in LandXML).
+        if (
+            idx < len(segments) - 1
+            and hi_int < sta_internal_end - 1e-9
+            and hi_int > sta_start + 1e-9
+        ):
+            cp = sample(hi_int, disp_hi)
+            if cp is not None:
+                out.append(cp)
 
     if include_endpoints:
-        cp = sample(sta_end)
+        cp = sample(sta_internal_end, sta_display_end)
         if cp is not None:
             out.append(cp)
 

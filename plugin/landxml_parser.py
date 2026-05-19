@@ -93,6 +93,25 @@ class SpiralSeg:
 Segment = LineSeg | CurveSeg | SpiralSeg
 
 
+@dataclass(frozen=True)
+class StaEquation:
+    """One ``<StaEquation>`` child of an ``<Alignment>``.
+
+    LandXML semantics: ``sta_internal`` is the alignment's *continuous*
+    station coordinate at the equation point (defaulting to ``sta_back``
+    when the attribute is omitted). ``sta_back`` is the displayed station
+    just before the equation; ``sta_ahead`` is the displayed station just
+    after. A forward equation (``sta_ahead > sta_back``) introduces a gap
+    in the displayed station axis; a back equation (``sta_ahead <
+    sta_back``) creates an overlap where two displayed station values
+    refer to a single internal point.
+    """
+
+    sta_back: float
+    sta_ahead: float
+    sta_internal: float
+
+
 @dataclass
 class PVI:
     """Point of Vertical Intersection — a vertex in the vertical alignment."""
@@ -140,6 +159,9 @@ class Alignment:
     # Best-effort track number lifted from <Feature name="...track..."> children
     # of <Alignment>; falls back to a 3-5 digit run found in the alignment name.
     track_number: str | None = None
+    # Station equations (``<StaEquation>`` children), sorted by ``sta_internal``.
+    # Empty when the alignment has continuous stationing.
+    equations: list[StaEquation] = field(default_factory=list)
 
 
 @dataclass
@@ -311,6 +333,41 @@ def _parse_profile_item(elem: ET.Element) -> ProfileItem | None:
                 radius = None
         return VertCurve(station=sta, elev=elev, length=length, radius=radius)
     return None
+
+
+def _parse_station_equations(alignment_elem: ET.Element) -> list[StaEquation]:
+    """Collect ``<StaEquation>`` children, defaulting ``staInternal`` to ``staBack``.
+
+    Equations are returned sorted by ``sta_internal`` so the downstream
+    map-builder doesn't have to re-sort. LandXML places ``<StaEquation>``
+    as a direct child of ``<Alignment>`` (occasionally inside
+    ``<CoordGeom>``), so we accept both.
+    """
+    out: list[StaEquation] = []
+    for child in alignment_elem.iter():
+        if _strip_ns(child.tag) != "StaEquation":
+            continue
+        back_attr = child.attrib.get("staBack")
+        ahead_attr = child.attrib.get("staAhead")
+        if back_attr is None or ahead_attr is None:
+            continue
+        try:
+            sta_back = float(back_attr)
+            sta_ahead = float(ahead_attr)
+        except ValueError:
+            continue
+        internal_attr = child.attrib.get("staInternal")
+        try:
+            sta_internal = float(internal_attr) if internal_attr else sta_back
+        except ValueError:
+            sta_internal = sta_back
+        out.append(
+            StaEquation(
+                sta_back=sta_back, sta_ahead=sta_ahead, sta_internal=sta_internal
+            )
+        )
+    out.sort(key=lambda e: e.sta_internal)
+    return out
 
 
 def _parse_profile(elem: ET.Element) -> Profile:
@@ -512,6 +569,7 @@ def parse_alignments_with_meta(
             segments = list(_iter_coord_geom(coord_geom))
         profile_elem = _child(alignments_node, "Profile")
         profile = _parse_profile(profile_elem) if profile_elem is not None else None
+        equations = _parse_station_equations(alignments_node)
         alignments.append(
             Alignment(
                 name=name,
@@ -520,6 +578,7 @@ def parse_alignments_with_meta(
                 segments=segments,
                 profile=profile,
                 track_number=_extract_track_number(alignments_node, name),
+                equations=equations,
             )
         )
     return alignments, meta
