@@ -20,6 +20,8 @@ ALIGNMENT_LAYER_PREFIX = "Alignments"
 SEGMENTS_LAYER_PREFIX = "Segments"
 STATIONS_LAYER_PREFIX = "Stations"
 DIMENSIONS_LAYER_PREFIX = "Dimensions"
+VERTICAL_PROFILE_LAYER = "VerticalProfile"
+CROSS_SECTIONS_LAYER = "CrossSections"
 
 # In-memory only — interval chainage labels along the Alignments layer.
 # Not persisted to the GeoPackage; rebuilt on every import.

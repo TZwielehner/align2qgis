@@ -27,11 +27,12 @@ from .dimensions import build_dimensions
 from .geometry_builder import (
     alignment_chainage,
     alignment_polyline,
+    alignment_xy_at_station,
     segment_curvature,
     segment_length,
     segment_points,
 )
-from .landxml_parser import CurveSeg, LandXMLMetadata, SpiralSeg
+from .landxml_parser import CurveSeg, LandXMLMetadata, SpiralSeg, VertCurve
 from .stationing import format_station, upright_bearing
 
 
@@ -142,6 +143,7 @@ def segment_fields() -> list[QgsField]:
         QgsField("sta_end", QMetaType.Type.Double),
         QgsField("rot", QMetaType.Type.QString),
         QgsField("desc", QMetaType.Type.QString),
+        QgsField("status", QMetaType.Type.QString),
         QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
     ]
 
@@ -205,6 +207,7 @@ def build_segment_layer(
             feat.setAttribute("sta_end", sta + length)
             feat.setAttribute("rot", rot)
             feat.setAttribute("desc", getattr(seg, "desc", None) or "")
+            feat.setAttribute("status", getattr(seg, "status", "") or "")
             feat.setAttribute(SOURCE_FILE_FIELD, source_file)
             features.append(feat)
             sta += length
@@ -381,6 +384,100 @@ def build_dimension_layer(
             feat.setAttribute(SOURCE_FILE_FIELD, source_file)
             features.append(feat)
 
+    layer.dataProvider().addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+def vertical_profile_fields() -> list[QgsField]:
+    return [
+        QgsField("alignment", QMetaType.Type.QString),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+        QgsField("station", QMetaType.Type.Double),
+        QgsField("elevation", QMetaType.Type.Double),
+        QgsField("vc_length", QMetaType.Type.Double),
+        QgsField("kind", QMetaType.Type.QString),
+    ]
+
+
+def build_vertical_profile_layer(
+    alignments,
+    layer_name: str,
+    crs_authid: str,
+    *,
+    source_file: str = "",
+) -> QgsVectorLayer:
+    """One point feature per PVI / VertCurve vertex in each alignment's profile.
+
+    Geometry = plan-XY at the PVI station. The dock re-densifies (station,
+    elevation) on the fly via ``profile_samples``.
+    """
+    layer = _new_memory_layer(
+        layer_name, crs_authid, "Point", vertical_profile_fields(),
+    )
+    features: list[QgsFeature] = []
+    for alignment in alignments:
+        if alignment.profile is None:
+            continue
+        for prof_align in alignment.profile.alignments:
+            for item in prof_align.elements:
+                xy = alignment_xy_at_station(alignment, item.station)
+                if xy is None:
+                    continue
+                feat = QgsFeature(layer.fields())
+                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(*xy)))
+                feat.setAttribute("alignment", alignment.name)
+                feat.setAttribute(SOURCE_FILE_FIELD, source_file)
+                feat.setAttribute("station", item.station)
+                feat.setAttribute("elevation", item.elev)
+                vc_len = getattr(item, "length", 0.0) if isinstance(item, VertCurve) else 0.0
+                feat.setAttribute("vc_length", float(vc_len or 0.0))
+                feat.setAttribute("kind", item.kind)
+                features.append(feat)
+    layer.dataProvider().addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+def cross_sections_fields() -> list[QgsField]:
+    return [
+        QgsField("alignment", QMetaType.Type.QString),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+        QgsField("station", QMetaType.Type.Double),
+        QgsField("offset", QMetaType.Type.Double),
+        QgsField("elevation", QMetaType.Type.Double),
+    ]
+
+
+def build_cross_sections_layer(
+    cross_sections,
+    alignments,
+    layer_name: str,
+    crs_authid: str,
+    *,
+    source_file: str = "",
+) -> QgsVectorLayer:
+    """One point per cross-section sample. Created empty when none in file."""
+    layer = _new_memory_layer(
+        layer_name, crs_authid, "Point", cross_sections_fields(),
+    )
+    by_name = {a.name: a for a in alignments}
+    features: list[QgsFeature] = []
+    for cs in cross_sections:
+        alignment = by_name.get(cs.alignment_name)
+        if alignment is None:
+            continue
+        xy = alignment_xy_at_station(alignment, cs.station)
+        if xy is None:
+            continue
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(*xy)))
+        feat.setAttribute("alignment", cs.alignment_name)
+        feat.setAttribute(SOURCE_FILE_FIELD, source_file)
+        feat.setAttribute("station", cs.station)
+        feat.setAttribute("offset", cs.offset)
+        feat.setAttribute("elevation", cs.elevation)
+        features.append(feat)
     layer.dataProvider().addFeatures(features)
     layer.updateExtents()
     return layer

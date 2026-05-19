@@ -3,9 +3,8 @@
 Wires the QGIS menu actions, the profile dock, and the layer-tree group
 together. The actual work is delegated to the focused modules:
 
-* :mod:`.layers`        — build the four output layers from parsed alignments.
+* :mod:`.layers`        — build the six output layers from parsed alignments.
 * :mod:`.styling`       — label rotation, tick marker, dimension label colour.
-* :mod:`.cache`         — keep parsed alignments + densified profile in RAM.
 * :mod:`.import_dialog` — single dialog that collects every option.
 * :mod:`.gpkg_writer`   — persist memory layers into a GeoPackage.
 * :mod:`.profile_dock`  — interactive curvature + vertical profile widget.
@@ -31,10 +30,10 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from . import cache
 from .constants import (
     ALIGNMENT_LAYER_PREFIX,
     CHAINAGE_LABEL_LAYER,
+    CROSS_SECTIONS_LAYER,
     DIMENSIONS_LAYER_PREFIX,
     PLUGIN_NAME,
     PROP_CRS,
@@ -42,16 +41,19 @@ from .constants import (
     SEGMENTS_LAYER_PREFIX,
     SOURCE_FILE_FIELD,
     STATIONS_LAYER_PREFIX,
+    VERTICAL_PROFILE_LAYER,
 )
 from .gpkg_writer import write_layers_to_gpkg
 from .import_dialog import Align2QgisImportDialog, ImportOptions
-from .landxml_parser import inspect_landxml, parse_alignments_with_meta
+from .landxml_parser import inspect_landxml, parse_alignments_with_meta, parse_cross_sections
 from .layers import (
     build_alignment_layer,
     build_chainage_label_layer,
+    build_cross_sections_layer,
     build_dimension_layer,
     build_segment_layer,
     build_stations_layer,
+    build_vertical_profile_layer,
     tag_layer,
 )
 from .profile_dock import Align2QgisProfileDock
@@ -73,6 +75,8 @@ _KIND_SEGMENTS = "segments"
 _KIND_STATIONS = "stations"
 _KIND_DIMENSIONS = "dimensions"
 _KIND_CHAINAGE = "chainage"
+_KIND_VERTICAL_PROFILE = "vertical_profile"
+_KIND_CROSS_SECTIONS = "cross_sections"
 
 
 class Align2QgisPlugin:
@@ -185,49 +189,72 @@ class Align2QgisPlugin:
             self.profile_dock.clear()
             self._disconnect_station_layer()
             return
-        self._load_alignment_into_dock(source)
+        # Resolve a concrete alignment name from the Alignments layer for this source.
+        align_name = self._first_alignment_name_for_source(source)
+        if align_name:
+            self._load_alignment_into_dock(align_name)
+        else:
+            self.profile_dock.clear()
+            self._disconnect_station_layer()
 
-    def _on_dock_alignment_picked(self, source_path: str) -> None:
-        if source_path:
-            self._load_alignment_into_dock(source_path)
+    def _first_alignment_name_for_source(self, source_path: str) -> str | None:
+        """Return the first alignment name whose source_file matches the basename."""
+        aligns_layer = self._find_named_layer(QgsProject.instance(), ALIGNMENT_LAYER_PREFIX)
+        if aligns_layer is None:
+            return None
+        base = os.path.basename(source_path)
+        for feat in aligns_layer.getFeatures():
+            if str(feat[SOURCE_FILE_FIELD] or "") == base:
+                name = str(feat["name"] or "")
+                if name:
+                    return name
+        return None
 
-    def _load_alignment_into_dock(self, source_path: str) -> None:
-        """Wire the dock's segment + station + vertical-profile state to
-        ``source_path``. The Segments / Stations layers are now shared
-        across all imports, so we filter the dock by the cached alignment
-        names for this source path.
-        """
+    def _on_dock_alignment_picked(self, alignment_name: str) -> None:
+        if alignment_name:
+            self._load_alignment_into_dock(alignment_name)
+
+    def _load_alignment_into_dock(self, alignment_name: str) -> None:
+        """Wire the dock to the chosen alignment name, reading from project layers."""
         if self.profile_dock is None:
             return
-        seg_layer, stn_layer = self._find_dock_layers()
-        alignment_names = [a.name for a in cache.alignments(source_path)]
+        seg_layer, stn_layer, vp_layer = self._find_dock_layers()
         self.profile_dock.set_alignment(
             seg_layer,
-            vert_profile=cache.vert_samples(source_path),
-            title=os.path.basename(source_path),
-            alignment_names=alignment_names,
+            vert_profile_layer=vp_layer,
+            alignment_name=alignment_name,
         )
-        self.profile_dock.select_alignment(source_path)
+        self.profile_dock.select_alignment(alignment_name)
         self._connect_station_layer(stn_layer)
 
-    def _find_dock_layers(self) -> tuple[QgsVectorLayer | None, QgsVectorLayer | None]:
-        """Locate the canonical Segments + Stations layers in the project."""
+    def _find_dock_layers(
+        self,
+    ) -> tuple[QgsVectorLayer | None, QgsVectorLayer | None, QgsVectorLayer | None]:
+        """Locate the canonical Segments, Stations, and VerticalProfile layers."""
         seg_layer: QgsVectorLayer | None = None
         stn_layer: QgsVectorLayer | None = None
+        vp_layer: QgsVectorLayer | None = None
         for ml in QgsProject.instance().mapLayers().values():
             name = ml.name()
             if name == SEGMENTS_LAYER_PREFIX:
                 seg_layer = ml
             elif name == STATIONS_LAYER_PREFIX:
                 stn_layer = ml
-        return seg_layer, stn_layer
+            elif name == VERTICAL_PROFILE_LAYER:
+                vp_layer = ml
+        return seg_layer, stn_layer, vp_layer
 
     def _available_alignments(self) -> list[tuple[str, str]]:
+        """Return ``[(alignment_name, label), …]`` from the Alignments layer."""
+        aligns_layer = self._find_named_layer(QgsProject.instance(), ALIGNMENT_LAYER_PREFIX)
+        if aligns_layer is None:
+            return []
         seen: dict[str, str] = {}
-        for ml in QgsProject.instance().mapLayers().values():
-            source = ml.customProperty(PROP_SOURCE_PATH, "")
-            if source and source not in seen:
-                seen[source] = os.path.basename(source)
+        for feat in aligns_layer.getFeatures():
+            name = str(feat["name"] or "")
+            source = str(feat[SOURCE_FILE_FIELD] or "")
+            if name and name not in seen:
+                seen[name] = f"{name} — {source}" if source else name
         return sorted(seen.items(), key=lambda kv: kv[1])
 
     def _refresh_dock_combo(self) -> None:
@@ -375,13 +402,19 @@ class Align2QgisPlugin:
 
         base = os.path.basename(opts.landxml_path)
         replaced = self._purge_existing(opts.landxml_path)
-        cache.remember(opts.landxml_path, alignments)
+
+        try:
+            with open(opts.landxml_path, "rb") as fh:
+                xml_bytes = fh.read()
+            cross_sections = parse_cross_sections(xml_bytes)
+        except Exception:
+            cross_sections = []
 
         # Build fresh memory layers from this import. Each carries the
         # source_file column so the per-import purge can find them later.
         imported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         new_layers = self._build_layers(
-            alignments, opts, base, imported_at, meta,
+            alignments, cross_sections, opts, base, imported_at, meta,
         )
 
         project = QgsProject.instance()
@@ -426,7 +459,7 @@ class Align2QgisPlugin:
         return alignments, meta
 
     def _build_layers(
-        self, alignments, opts: ImportOptions, base: str,
+        self, alignments, cross_sections, opts: ImportOptions, base: str,
         imported_at: str, meta,
     ) -> list[tuple[QgsVectorLayer, str, str, bool]]:
         """Return ``[(layer, canonical_name, kind, persist_to_gpkg), …]``.
@@ -483,6 +516,17 @@ class Align2QgisPlugin:
             ))
             if dim_layer.featureCount() > 0:
                 out.append((dim_layer, DIMENSIONS_LAYER_PREFIX, _KIND_DIMENSIONS, True))
+
+        # Always persist VerticalProfile and CrossSections (may be empty layers).
+        vp_layer = tag(build_vertical_profile_layer(
+            alignments, VERTICAL_PROFILE_LAYER, crs, source_file=base,
+        ))
+        out.append((vp_layer, VERTICAL_PROFILE_LAYER, _KIND_VERTICAL_PROFILE, True))
+
+        xs_layer = tag(build_cross_sections_layer(
+            cross_sections, alignments, CROSS_SECTIONS_LAYER, crs, source_file=base,
+        ))
+        out.append((xs_layer, CROSS_SECTIONS_LAYER, _KIND_CROSS_SECTIONS, True))
 
         return out
 
@@ -586,7 +630,7 @@ class Align2QgisPlugin:
         for layer_name in (
             ALIGNMENT_LAYER_PREFIX, SEGMENTS_LAYER_PREFIX,
             STATIONS_LAYER_PREFIX, DIMENSIONS_LAYER_PREFIX,
-            CHAINAGE_LABEL_LAYER,
+            CHAINAGE_LABEL_LAYER, VERTICAL_PROFILE_LAYER, CROSS_SECTIONS_LAYER,
         ):
             layer = self._find_named_layer(project, layer_name)
             if layer is None:
@@ -609,5 +653,4 @@ class Align2QgisPlugin:
             layer.updateExtents()
             layer.triggerRepaint()
             touched += 1
-        cache.forget(source_path)
         return touched

@@ -59,6 +59,7 @@ class LineSeg:
     length: float | None = None
     kind: str = "line"
     desc: str | None = None  # raw LandXML ``desc`` — often a design-speed tag
+    status: str = ""
 
 
 @dataclass
@@ -71,6 +72,7 @@ class CurveSeg:
     length: float | None = None
     kind: str = "curve"
     desc: str | None = None
+    status: str = ""
 
 
 @dataclass
@@ -85,6 +87,7 @@ class SpiralSeg:
     spi_type: str = "clothoid"
     kind: str = "spiral"
     desc: str | None = None
+    status: str = ""
 
 
 Segment = LineSeg | CurveSeg | SpiralSeg
@@ -147,6 +150,47 @@ class LandXMLMetadata:
     landxml_version: str | None = None
 
 
+@dataclass
+class CrossSectionSample:
+    """One ``<PntList3D>`` sample inside a ``<CrossSect>`` element."""
+
+    alignment_name: str
+    station: float
+    offset: float
+    elevation: float
+
+
+_STATUS_KEYWORDS = re.compile(
+    r"\b(new|exist(?:ing)?|demolish(?:ion)?|temporary|temp)\b", re.IGNORECASE
+)
+_STATUS_NORMALISE = {
+    "existing": "exist", "demolition": "demolish", "temporary": "temp",
+}
+
+
+def _extract_status(elem: ET.Element, desc: str | None) -> str:
+    """Best-effort segment status from <Feature> children or the desc attribute.
+
+    Precedence: Feature name/code attribute wins; desc fallback used only when
+    no matching Feature is found.
+    """
+    for child in elem:
+        if _strip_ns(child.tag) != "Feature":
+            continue
+        for attr in ("name", "code", "value"):
+            val = (child.attrib.get(attr) or "").lower().strip()
+            m = _STATUS_KEYWORDS.search(val)
+            if m:
+                word = m.group(1).lower()
+                return _STATUS_NORMALISE.get(word, word)
+    if desc:
+        m = _STATUS_KEYWORDS.search(desc)
+        if m:
+            word = m.group(1).lower()
+            return _STATUS_NORMALISE.get(word, word)
+    return ""
+
+
 def _parse_radius(text: str | None) -> float | None:
     if text is None or text.strip() == "" or text.strip().lower() in ("inf", "infinity"):
         return None
@@ -158,11 +202,13 @@ def _parse_line(elem: ET.Element) -> LineSeg:
     start = _parse_point(_required_child(elem, "Start").text)
     end = _parse_point(_required_child(elem, "End").text)
     length_attr = elem.attrib.get("length")
+    desc = elem.attrib.get("desc")
     return LineSeg(
         start=start,
         end=end,
         length=float(length_attr) if length_attr else None,
-        desc=elem.attrib.get("desc"),
+        desc=desc,
+        status=_extract_status(elem, desc),
     )
 
 
@@ -178,6 +224,7 @@ def _parse_curve(elem: ET.Element) -> CurveSeg:
         radius = (dn * dn + de * de) ** 0.5
     rot = (elem.attrib.get("rot") or "ccw").lower()
     length_attr = elem.attrib.get("length")
+    desc = elem.attrib.get("desc")
     return CurveSeg(
         start=start,
         center=center,
@@ -185,7 +232,8 @@ def _parse_curve(elem: ET.Element) -> CurveSeg:
         radius=radius,
         rot=rot,
         length=float(length_attr) if length_attr else None,
-        desc=elem.attrib.get("desc"),
+        desc=desc,
+        status=_extract_status(elem, desc),
     )
 
 
@@ -199,6 +247,7 @@ def _parse_spiral(elem: ET.Element) -> SpiralSeg:
     spi_type = (elem.attrib.get("spiType") or "clothoid").lower()
     rs = _parse_radius(elem.attrib.get("radiusStart"))
     re_ = _parse_radius(elem.attrib.get("radiusEnd"))
+    desc = elem.attrib.get("desc")
     return SpiralSeg(
         start=start,
         pi=pi,
@@ -208,7 +257,8 @@ def _parse_spiral(elem: ET.Element) -> SpiralSeg:
         radius_end=re_,
         rot=rot,
         spi_type=spi_type,
-        desc=elem.attrib.get("desc"),
+        desc=desc,
+        status=_extract_status(elem, desc),
     )
 
 
@@ -473,3 +523,50 @@ def parse_alignments_with_meta(
             )
         )
     return alignments, meta
+
+
+def parse_cross_sections(source: str | bytes) -> list[CrossSectionSample]:
+    """Parse ``<Alignment>/<CrossSects>/<CrossSect>`` and yield samples.
+
+    A ``<CrossSect>`` may carry ``<PntList3D>`` text of triplets
+    ``offset elevation [extra]``; when that's missing we still emit a single
+    on-centreline sample so downstream code sees the station exists.
+    """
+    root = _root_from_source(source)
+    out: list[CrossSectionSample] = []
+    for alignments_node in root.iter():
+        if _strip_ns(alignments_node.tag) != "Alignment":
+            continue
+        align_name = alignments_node.attrib.get("name") or "Alignment"
+        for child in alignments_node:
+            if _strip_ns(child.tag) != "CrossSects":
+                continue
+            for xs in child:
+                if _strip_ns(xs.tag) != "CrossSect":
+                    continue
+                sta_attr = xs.attrib.get("sta") or xs.attrib.get("station")
+                try:
+                    station = float(sta_attr) if sta_attr else 0.0
+                except ValueError:
+                    continue
+                pnt_list = _child(xs, "PntList3D")
+                samples_added = 0
+                if pnt_list is not None and pnt_list.text:
+                    nums = pnt_list.text.split()
+                    for i in range(0, len(nums) - 1, 2):
+                        try:
+                            off = float(nums[i])
+                            elev = float(nums[i + 1])
+                        except ValueError:
+                            continue
+                        out.append(CrossSectionSample(
+                            alignment_name=align_name, station=station,
+                            offset=off, elevation=elev,
+                        ))
+                        samples_added += 1
+                if samples_added == 0:
+                    out.append(CrossSectionSample(
+                        alignment_name=align_name, station=station,
+                        offset=0.0, elevation=0.0,
+                    ))
+    return out

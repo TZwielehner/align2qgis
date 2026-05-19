@@ -28,6 +28,8 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsVectorLayer
 
+from .landxml_parser import PVI, VertCurve, ProfAlign, Profile, profile_samples
+
 _SLIDER_STEPS = 100000  # int range; sub-decimetre resolution on a 10 km alignment
 
 try:
@@ -83,7 +85,7 @@ def _optional_float(value) -> float | None:
 class Align2QgisProfileDock(QDockWidget):
     """Floating/dock widget showing curvature + vertical profile of an alignment."""
 
-    alignmentSelected = pyqtSignal(str)  # emits the chosen source_path
+    alignmentSelected = pyqtSignal(str)  # emits the chosen alignment name
 
     def __init__(self, parent=None) -> None:
         super().__init__("Align2QGIS — Alignment Profile", parent)
@@ -157,26 +159,23 @@ class Align2QgisProfileDock(QDockWidget):
     def set_alignment(
         self,
         segments_layer: QgsVectorLayer | None,
-        vert_profile: list[tuple[float, float]] | None = None,
-        title: str = "",
-        alignment_names: list[str] | None = None,
+        vert_profile_layer: QgsVectorLayer | None = None,
+        alignment_name: str = "",
     ) -> None:
-        """Populate from the shared ``Segments`` layer + optional vertical profile.
+        """Populate from the canonical ``Segments`` and ``VerticalProfile`` layers.
 
-        Under the canonical-schema model, the ``Segments`` layer holds rows
-        from every import. ``alignment_names`` filters to just the ones
-        belonging to the currently-selected source file. ``None`` = no filter
-        (legacy single-file behaviour).
+        Both layers are filtered to ``alignment_name``. The PVI rows from
+        ``vert_profile_layer`` are reconstructed into a ``Profile`` object and
+        passed through ``profile_samples`` so the plot is faithful to the
+        parabolic vertical-curve math.
         """
         self._segments = []
-        self._title = title
-        wanted = set(alignment_names) if alignment_names is not None else None
+        self._title = alignment_name
         if segments_layer is not None and segments_layer.isValid():
             for feat in segments_layer.getFeatures():
                 try:
-                    if wanted is not None:
-                        if str(feat["alignment"]) not in wanted:
-                            continue
+                    if alignment_name and str(feat["alignment"]) != alignment_name:
+                        continue
                     seg = _Segment(
                         kind=str(feat["kind"]),
                         sta_start=_safe_float(feat["sta_start"]),
@@ -191,7 +190,7 @@ class Align2QgisProfileDock(QDockWidget):
             self._segments.sort(key=lambda s: s.sta_start)
         self._seg_starts = [s.sta_start for s in self._segments]
 
-        pairs = sorted(vert_profile or [])
+        pairs = self._densify_vert_profile(vert_profile_layer, alignment_name)
         self._vert_stations = [s for s, _ in pairs]
         self._vert_elevs = [e for _, e in pairs]
 
@@ -200,6 +199,33 @@ class Align2QgisProfileDock(QDockWidget):
         self._sync_slider_range()
         self._redraw_static()
         self._update_highlight()
+
+    @staticmethod
+    def _densify_vert_profile(
+        layer: QgsVectorLayer | None, alignment_name: str,
+    ) -> list[tuple[float, float]]:
+        """Read PVI rows from ``layer``, reconstruct a Profile, call profile_samples."""
+        if layer is None or not layer.isValid():
+            return []
+        items = []
+        for feat in layer.getFeatures():
+            try:
+                if alignment_name and str(feat["alignment"]) != alignment_name:
+                    continue
+                sta = _safe_float(feat["station"])
+                elev = _safe_float(feat["elevation"])
+                vc_len = _safe_float(feat["vc_length"])
+                kind = str(feat["kind"] or "pvi")
+            except KeyError:
+                continue
+            if kind == "pvi" or vc_len <= 0:
+                items.append(PVI(station=sta, elev=elev))
+            else:
+                items.append(VertCurve(station=sta, elev=elev, length=vc_len))
+        if not items:
+            return []
+        prof = Profile(name="", alignments=[ProfAlign(name="", elements=items)])
+        return profile_samples(prof)
 
     def set_highlight_station(self, station_m: float | None) -> None:
         self._highlight_sta = station_m
@@ -220,18 +246,16 @@ class Align2QgisProfileDock(QDockWidget):
         self._update_highlight()
 
     def set_alignments_available(self, items: list[tuple[str, str]]) -> None:
-        """Refresh the alignment-picker combo. ``items`` is ``[(source_path, label), …]``.
+        """Refresh the alignment-picker combo. ``items`` is ``[(alignment_name, label), …]``.
 
         Signals are blocked while we repopulate so we don't trigger a
-        spurious ``alignmentSelected`` when the plugin pushes a new list
-        in response to a layer added/removed in the project.
+        spurious ``alignmentSelected`` when the plugin pushes a new list.
         """
         self.alignment_combo.blockSignals(True)
         current = self.alignment_combo.currentData()
         self.alignment_combo.clear()
-        for source_path, label in items:
-            self.alignment_combo.addItem(label, source_path)
-        # Try to re-select what was previously active.
+        for alignment_name, label in items:
+            self.alignment_combo.addItem(label, alignment_name)
         if current is not None:
             for i in range(self.alignment_combo.count()):
                 if self.alignment_combo.itemData(i) == current:
@@ -239,10 +263,10 @@ class Align2QgisProfileDock(QDockWidget):
                     break
         self.alignment_combo.blockSignals(False)
 
-    def select_alignment(self, source_path: str) -> None:
+    def select_alignment(self, alignment_name: str) -> None:
         """Programmatically set the combo without re-emitting the signal."""
         for i in range(self.alignment_combo.count()):
-            if self.alignment_combo.itemData(i) == source_path:
+            if self.alignment_combo.itemData(i) == alignment_name:
                 self.alignment_combo.blockSignals(True)
                 self.alignment_combo.setCurrentIndex(i)
                 self.alignment_combo.blockSignals(False)
@@ -251,9 +275,9 @@ class Align2QgisProfileDock(QDockWidget):
     def _on_combo_changed(self, index: int) -> None:
         if index < 0:
             return
-        source = self.alignment_combo.itemData(index)
-        if source:
-            self.alignmentSelected.emit(source)
+        name = self.alignment_combo.itemData(index)
+        if name:
+            self.alignmentSelected.emit(name)
 
     # ------------------------------------------------------------------
     # Slider plumbing

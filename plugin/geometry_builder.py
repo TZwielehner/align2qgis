@@ -441,6 +441,37 @@ def _segment_walkers(alignment: Alignment) -> list[tuple]:
     return walkers
 
 
+def alignment_xy_at_station(
+    alignment: Alignment, station: float,
+) -> tuple[float, float] | None:
+    """Return plan-XY at ``station`` along ``alignment``, or None if out of range.
+
+    Walks the same segment pose functions ``alignment_chainage`` uses, but
+    returns just (x, y) for a single station — used by the PVI and
+    cross-section layer builders to place per-station point features.
+    """
+    walkers = _segment_walkers(alignment)
+    if not walkers:
+        return None
+    total = sum(w[0] for w in walkers)
+    if total <= 0:
+        return None
+    sta_start = alignment.sta_start or 0.0
+    s = station - sta_start
+    if s < -1e-6 or s > total + 1e-6:
+        return None
+    if s >= total:
+        length, pose_fn, *_ = walkers[-1]
+        x, y, _ = pose_fn(length)
+        return (x, y)
+    for length, pose_fn, *_ in walkers:
+        if s <= length + 1e-9:
+            x, y, _ = pose_fn(max(0.0, s))
+            return (x, y)
+        s -= length
+    return None
+
+
 def alignment_chainage(
     alignment: Alignment,
     interval: float,
