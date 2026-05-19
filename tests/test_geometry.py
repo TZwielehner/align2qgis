@@ -463,6 +463,34 @@ def test_spiral_arc_chord_error_stays_under_budget():
     assert worst < budget * 3
 
 
+def test_spiral_picks_correct_rot_against_wrong_landxml_attr():
+    # Construct a clothoid whose geometry is CCW (radius_end positive, end
+    # north of the start tangent) but mark it rot="cw" in LandXML. The
+    # disambiguator must integrate both sign conventions and prefer the one
+    # whose integrated end matches the LandXML <End>.
+    L, R = 100.0, 200.0
+    seg, end_world = _fresnel_clothoid_seg(L, R)
+    # Flip rot to the wrong value — geometry stays CCW.
+    bad = SpiralSeg(
+        start=seg.start,
+        pi=seg.pi,
+        end=seg.end,
+        length=seg.length,
+        radius_start=seg.radius_start,
+        radius_end=seg.radius_end,
+        rot="cw",  # deliberately wrong
+    )
+    pts = spiral_points(bad)
+    # The picked rot should still produce the correct world end.
+    assert _close(pts[-1], end_world, tol=1e-6)
+    # Mid-spiral point should land on the CCW-side of the start tangent
+    # (positive y in this local frame after the tangent-aligned rotation).
+    mid = pts[len(pts) // 2]
+    sx, sy = 2000.0, 1000.0  # in QGIS axes (x=E, y=N)
+    # The start tangent points +x; CCW spiral curves toward +y.
+    assert mid[1] > sy + 1e-6
+
+
 def test_spiral_with_infinite_radii_yields_single_piece():
     # Both radii infinite → dκ/ds == 0 → one arc piece (geometrically a line).
     seg = SpiralSeg(

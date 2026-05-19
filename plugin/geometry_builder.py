@@ -126,57 +126,6 @@ def _local_clothoid(
     return pts
 
 
-def spiral_points(seg: SpiralSeg, samples_per_meter: float = 0.5) -> list[XY]:
-    """Discretize a clothoid spiral and place it in world coords.
-
-    Strategy:
-    1. Integrate locally with start at origin and initial tangent = +x.
-    2. Compute the rotation/translation that maps local start→world start
-       AND local initial tangent → world tangent at start.
-
-    The world tangent at start is inferred from the PI point when available
-    (Start→PI direction is the tangent at Start); otherwise we fall back to
-    solving against the End point.
-    """
-    sx, sy = ne_to_xy(seg.start)
-    ex, ey = ne_to_xy(seg.end)
-    L = seg.length
-
-    # Curvature at start / end. None means infinite radius (straight tangent).
-    r0 = seg.radius_start
-    r1 = seg.radius_end
-    sign = -1.0 if seg.rot.lower() == "cw" else 1.0
-    k0 = 0.0 if r0 is None else sign / r0
-    k1 = 0.0 if r1 is None else sign / r1
-
-    n = max(16, int(math.ceil(L * samples_per_meter)))
-    local = _local_clothoid(L, k0, k1, n)
-
-    # Determine world rotation. Prefer PI tangent if present.
-    if seg.pi is not None:
-        px, py = ne_to_xy(seg.pi)
-        tx = px - sx
-        ty = py - sy
-        norm = math.hypot(tx, ty)
-        if norm > 1e-9:
-            cos_a = tx / norm
-            sin_a = ty / norm
-        else:
-            cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
-    else:
-        cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
-
-    world: list[XY] = []
-    for lx, ly in local:
-        wx = sx + cos_a * lx - sin_a * ly
-        wy = sy + sin_a * lx + cos_a * ly
-        world.append((wx, wy))
-    # Pin endpoints — small integration drift is expected for long spirals.
-    world[0] = (sx, sy)
-    world[-1] = (ex, ey)
-    return world
-
-
 def _solve_rotation_from_endpoints(
     local: list[XY], sx: float, sy: float, ex: float, ey: float
 ) -> tuple[float, float]:
@@ -190,6 +139,94 @@ def _solve_rotation_from_endpoints(
     cos_a = (lx * dx + ly * dy) / denom
     sin_a = (lx * dy - ly * dx) / denom
     return cos_a, sin_a
+
+
+def _spiral_placement(
+    seg: SpiralSeg, n_samples: int,
+) -> tuple[float, float, float, float, float, float, list[XY]]:
+    """Resolve ``(sx, sy, cos_a, sin_a, k0, k1, local)`` with rot disambiguation.
+
+    LandXML ``rot`` is unreliable in the wild — some exporters always write
+    ``ccw`` regardless of the actual turning direction. We integrate the
+    clothoid under both sign conventions and score which one reproduces the
+    LandXML ``<End>`` more faithfully, mirroring the length-based picker in
+    :func:`_arc_geometry`.
+
+    Residual depends on what fixes the world rotation:
+
+    * With ``<PI>`` the rotation is set by the start tangent; we measure
+      metric distance between the transformed integrated end and ``<End>``.
+    * Without ``<PI>`` the rotation is solved to land on ``<End>`` by
+      construction, so we score by how close ``cos²+sin²`` is to 1.0 — a
+      non-unit rotation means the integrated end has the wrong magnitude,
+      i.e. the curvature signs are wrong.
+
+    The declared ``rot`` is tried first so ties resolve to the LandXML
+    attribute and existing geometry stays bit-stable.
+    """
+    sx, sy = ne_to_xy(seg.start)
+    ex, ey = ne_to_xy(seg.end)
+    L = seg.length
+
+    pi_dir: tuple[float, float] | None = None
+    if seg.pi is not None:
+        px, py = ne_to_xy(seg.pi)
+        tx, ty = px - sx, py - sy
+        norm = math.hypot(tx, ty)
+        if norm > 1e-9:
+            pi_dir = (tx / norm, ty / norm)
+
+    declared_sign = -1.0 if seg.rot.lower() == "cw" else 1.0
+
+    best_residual = math.inf
+    best: tuple[float, float, float, float, list[XY]] = (1.0, 0.0, 0.0, 0.0, [])
+    for sign in (declared_sign, -declared_sign):
+        k0 = 0.0 if seg.radius_start is None else sign / seg.radius_start
+        k1 = 0.0 if seg.radius_end is None else sign / seg.radius_end
+        local = _local_clothoid(L, k0, k1, n_samples)
+        if pi_dir is not None:
+            cos_a, sin_a = pi_dir
+            lx, ly = local[-1]
+            wx = sx + cos_a * lx - sin_a * ly
+            wy = sy + sin_a * lx + cos_a * ly
+            residual = math.hypot(wx - ex, wy - ey)
+        else:
+            cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
+            residual = abs(cos_a * cos_a + sin_a * sin_a - 1.0)
+        if residual < best_residual:
+            best_residual = residual
+            best = (cos_a, sin_a, k0, k1, local)
+
+    cos_a, sin_a, k0, k1, local = best
+    return (sx, sy, cos_a, sin_a, k0, k1, local)
+
+
+def spiral_points(seg: SpiralSeg, samples_per_meter: float = 0.5) -> list[XY]:
+    """Discretize a clothoid spiral and place it in world coords.
+
+    Strategy:
+    1. Integrate locally with start at origin and initial tangent = +x.
+    2. Compute the rotation/translation that maps local start→world start
+       AND local initial tangent → world tangent at start.
+
+    The world tangent at start is inferred from the PI point when available
+    (Start→PI direction is the tangent at Start); otherwise we fall back to
+    solving against the End point. Rotation sign is disambiguated against
+    LandXML ``<End>`` so a wrong ``rot`` attribute doesn't flip the spiral.
+    """
+    L = seg.length
+    n = max(16, int(math.ceil(L * samples_per_meter)))
+    sx, sy, cos_a, sin_a, _, _, local = _spiral_placement(seg, n)
+    ex, ey = ne_to_xy(seg.end)
+    world: list[XY] = []
+    for lx, ly in local:
+        wx = sx + cos_a * lx - sin_a * ly
+        wy = sy + sin_a * lx + cos_a * ly
+        world.append((wx, wy))
+    # Pin endpoints — small integration drift is expected for long spirals.
+    world[0] = (sx, sy)
+    world[-1] = (ex, ey)
+    return world
 
 
 # ---------------------------------------------------------------------------
@@ -249,18 +286,18 @@ def spiral_arc_triples(
     deviation under the budget. Straight or constant-radius spirals
     (``dκ/ds ≈ 0``) collapse to a single piece.
     """
-    sx, sy = ne_to_xy(seg.start)
-    ex, ey = ne_to_xy(seg.end)
     L = seg.length
     if L <= 0:
         return []
 
-    sign = -1.0 if seg.rot.lower() == "cw" else 1.0
-    k0 = 0.0 if seg.radius_start is None else sign / seg.radius_start
-    k1 = 0.0 if seg.radius_end is None else sign / seg.radius_end
-
+    # Choose piece count from the curvature gradient before resolving the
+    # final rot sign — magnitude of dκ/ds is identical for either sign so
+    # the count is sign-stable.
+    declared_sign = -1.0 if seg.rot.lower() == "cw" else 1.0
+    k0_decl = 0.0 if seg.radius_start is None else declared_sign / seg.radius_start
+    k1_decl = 0.0 if seg.radius_end is None else declared_sign / seg.radius_end
     err = max(max_chord_err, 1e-6)
-    dk_ds = abs(k1 - k0) / L
+    dk_ds = abs(k1_decl - k0_decl) / L
     if dk_ds < 1e-12:
         n_arcs = 1
     else:
@@ -270,18 +307,8 @@ def spiral_arc_triples(
     # Sample on a grid twice as fine as the arc count so each arc gets a
     # start, midpoint, and end taken directly from the integrated clothoid.
     n_samples = 2 * n_arcs
-    local = _local_clothoid(L, k0, k1, n_samples)
-
-    if seg.pi is not None:
-        px, py = ne_to_xy(seg.pi)
-        tx, ty = px - sx, py - sy
-        norm = math.hypot(tx, ty)
-        if norm > 1e-9:
-            cos_a, sin_a = tx / norm, ty / norm
-        else:
-            cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
-    else:
-        cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
+    sx, sy, cos_a, sin_a, _, _, local = _spiral_placement(seg, n_samples)
+    ex, ey = ne_to_xy(seg.end)
 
     world: list[XY] = []
     for lx, ly in local:
@@ -400,32 +427,14 @@ def _arc_pose(setup: tuple[float, float, float, float, float, float], s: float) 
 
 
 def _spiral_setup(seg: SpiralSeg) -> tuple[float, float, float, float, float, float]:
-    """``(sx, sy, cos_a, sin_a, k0, k1)`` — world placement + curvature endpoints."""
-    sx, sy = ne_to_xy(seg.start)
-    ex, ey = ne_to_xy(seg.end)
-    L = seg.length
-    sign = -1.0 if seg.rot.lower() == "cw" else 1.0
-    k0 = 0.0 if seg.radius_start is None else sign / seg.radius_start
-    k1 = 0.0 if seg.radius_end is None else sign / seg.radius_end
+    """``(sx, sy, cos_a, sin_a, k0, k1)`` — world placement + curvature endpoints.
 
-    cos_a = 1.0
-    sin_a = 0.0
-    if seg.pi is not None:
-        px, py = ne_to_xy(seg.pi)
-        tx = px - sx
-        ty = py - sy
-        norm = math.hypot(tx, ty)
-        if norm > 1e-9:
-            cos_a, sin_a = tx / norm, ty / norm
-        else:
-            n = max(16, int(math.ceil(L * 0.5)))
-            local = _local_clothoid(L, k0, k1, n)
-            cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
-    else:
-        n = max(16, int(math.ceil(L * 0.5)))
-        local = _local_clothoid(L, k0, k1, n)
-        cos_a, sin_a = _solve_rotation_from_endpoints(local, sx, sy, ex, ey)
-
+    Thin wrapper around :func:`_spiral_placement` that drops the local
+    integration buffer (the chainage walker re-samples per station via
+    :func:`_spiral_pose`).
+    """
+    n = max(16, int(math.ceil(seg.length * 0.5)))
+    sx, sy, cos_a, sin_a, k0, k1, _ = _spiral_placement(seg, n)
     return (sx, sy, cos_a, sin_a, k0, k1)
 
 
