@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsFeature,
@@ -75,11 +75,11 @@ def build_alignment_layer(
     layer = _new_memory_layer(
         layer_name, crs_authid, "LineString",
         [
-            QgsField("name", QVariant.Type.String),
-            QgsField("length_xml", QVariant.Type.Double),
-            QgsField("length_geom", QVariant.Type.Double),
-            QgsField("sta_start", QVariant.Type.Double),
-            QgsField("n_segments", QVariant.Type.Int),
+            QgsField("name", QMetaType.Type.QString),
+            QgsField("length_xml", QMetaType.Type.Double),
+            QgsField("length_geom", QMetaType.Type.Double),
+            QgsField("sta_start", QMetaType.Type.Double),
+            QgsField("n_segments", QMetaType.Type.Int),
         ],
     )
 
@@ -110,20 +110,20 @@ def build_segment_layer(
     layer = _new_memory_layer(
         layer_name, crs_authid, "LineString",
         [
-            QgsField("alignment", QVariant.Type.String),
-            QgsField("seg_index", QVariant.Type.Int),
-            QgsField("kind", QVariant.Type.String),
-            QgsField("transition_type", QVariant.Type.String),
-            QgsField("length", QVariant.Type.Double),
-            QgsField("radius_start", QVariant.Type.Double),
-            QgsField("radius_end", QVariant.Type.Double),
-            QgsField("curvature_start", QVariant.Type.Double),
-            QgsField("curvature_end", QVariant.Type.Double),
-            QgsField("spiral_a", QVariant.Type.Double),
-            QgsField("sta_start", QVariant.Type.Double),
-            QgsField("sta_end", QVariant.Type.Double),
-            QgsField("rot", QVariant.Type.String),
-            QgsField("desc", QVariant.Type.String),
+            QgsField("alignment", QMetaType.Type.QString),
+            QgsField("seg_index", QMetaType.Type.Int),
+            QgsField("kind", QMetaType.Type.QString),
+            QgsField("transition_type", QMetaType.Type.QString),
+            QgsField("length", QMetaType.Type.Double),
+            QgsField("radius_start", QMetaType.Type.Double),
+            QgsField("radius_end", QMetaType.Type.Double),
+            QgsField("curvature_start", QMetaType.Type.Double),
+            QgsField("curvature_end", QMetaType.Type.Double),
+            QgsField("spiral_a", QMetaType.Type.Double),
+            QgsField("sta_start", QMetaType.Type.Double),
+            QgsField("sta_end", QMetaType.Type.Double),
+            QgsField("rot", QMetaType.Type.QString),
+            QgsField("desc", QMetaType.Type.QString),
         ],
     )
 
@@ -193,18 +193,18 @@ def build_chainage_layer(
     layer = _new_memory_layer(
         layer_name, crs_authid, "Point",
         [
-            QgsField("alignment", QVariant.Type.String),
-            QgsField("station", QVariant.Type.Double),
-            QgsField("label", QVariant.Type.String),
-            QgsField("rotation", QVariant.Type.Double),
-            QgsField("rotation_perp", QVariant.Type.Double),
-            QgsField("seg_index", QVariant.Type.Int),
-            QgsField("seg_kind", QVariant.Type.String),
-            QgsField("transition_type", QVariant.Type.String),
-            QgsField("curvature", QVariant.Type.Double),
-            QgsField("radius", QVariant.Type.Double),
-            QgsField("desc", QVariant.Type.String),
-            QgsField("is_endpoint", QVariant.Type.Bool),
+            QgsField("alignment", QMetaType.Type.QString),
+            QgsField("station", QMetaType.Type.Double),
+            QgsField("label", QMetaType.Type.QString),
+            QgsField("rotation", QMetaType.Type.Double),
+            QgsField("rotation_perp", QMetaType.Type.Double),
+            QgsField("seg_index", QMetaType.Type.Int),
+            QgsField("seg_kind", QMetaType.Type.QString),
+            QgsField("transition_type", QMetaType.Type.QString),
+            QgsField("curvature", QMetaType.Type.Double),
+            QgsField("radius", QMetaType.Type.Double),
+            QgsField("desc", QMetaType.Type.QString),
+            QgsField("is_endpoint", QMetaType.Type.Bool),
         ],
     )
 
@@ -258,14 +258,14 @@ def build_dimension_layer(
     layer = _new_memory_layer(
         layer_name, crs_authid, "Point",
         [
-            QgsField("alignment", QVariant.Type.String),
-            QgsField("seg_index", QVariant.Type.Int),
-            QgsField("kind", QVariant.Type.String),
-            QgsField("label", QVariant.Type.String),
-            QgsField("rotation", QVariant.Type.Double),
-            QgsField("radius", QVariant.Type.Double),
-            QgsField("spiral_a", QVariant.Type.Double),
-            QgsField("seg_length", QVariant.Type.Double),
+            QgsField("alignment", QMetaType.Type.QString),
+            QgsField("seg_index", QMetaType.Type.Int),
+            QgsField("kind", QMetaType.Type.QString),
+            QgsField("label", QMetaType.Type.QString),
+            QgsField("rotation", QMetaType.Type.Double),
+            QgsField("radius", QMetaType.Type.Double),
+            QgsField("spiral_a", QMetaType.Type.Double),
+            QgsField("seg_length", QMetaType.Type.Double),
         ],
     )
 
