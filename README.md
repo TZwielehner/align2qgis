@@ -62,13 +62,18 @@ under QGIS 4's stricter SIP bindings.
 
 ## CLI sanity-check (no QGIS required)
 
-`tools/dump_alignment.py` parses a LandXML file and prints WKT for each
-alignment so you can paste into QGIS via *Layer → Add Layer → Add Delimited
-Text Layer* or load with any GIS tool:
+`tools/dump_alignment.py` parses a LandXML file and prints `COMPOUNDCURVE`
+WKT for each alignment — circular arcs stay as analytic `CIRCULARSTRING`
+sub-pieces and clothoids as arc chains, matching what the plugin loads
+into QGIS:
 
 ```
 python3 tools/dump_alignment.py path/to/file.xml > alignments.wkt
+python3 tools/dump_alignment.py --3d path/to/file.xml > alignments_z.wkt
 ```
+
+The `--3d` flag pulls elevations from the LandXML `<Profile>` (when
+present) and emits `COMPOUNDCURVE Z`.
 
 ## Tests
 
