@@ -5,6 +5,7 @@ All output is in QGIS axis order: x = Easting, y = Northing. Inputs from
 """
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass
 from typing import Iterable
@@ -535,16 +536,40 @@ class ChainagePoint:
     desc: str              # passthrough of the segment's LandXML ``desc``
 
 
-def _segment_walkers(alignment: Alignment) -> list[tuple]:
-    """Return ``[(length, pose_fn, kind, transition, k_start, k_end, desc, idx), …]``.
+def _locate_walker(cum: list[float], s: float) -> int:
+    """Return the walker index whose arclength span contains ``s``.
+
+    ``cum`` is the strictly increasing list of cumulative end-stations
+    ``[len_0, len_0+len_1, …]``. We pick ``bisect_right(cum, s) - 1`` so
+    boundary stations land on the walker whose cumulative-end equals ``s``
+    (matching the original linear-scan semantics: "first walker whose
+    cum end ≥ s, then evaluate at local end"). The result is clamped to
+    ``[0, len(cum) - 1]``.
+    """
+    idx = bisect.bisect_left(cum, s)
+    if idx >= len(cum):
+        return len(cum) - 1
+    if idx < 0:
+        return 0
+    return idx
+
+
+def _segment_walkers(alignment: Alignment) -> tuple[list[tuple], list[float]]:
+    """Return ``(walkers, cum)`` where each walker is
+    ``(length, pose_fn, kind, transition, k_start, k_end, desc, idx)`` and
+    ``cum[i]`` is the cumulative arclength up to and including walker ``i``.
 
     ``pose_fn(s)`` returns ``(x, y, bearing_deg)`` at arclength ``s`` from the
     segment start. Curvature endpoints (``k_start``, ``k_end``) let the
     chainage walker linearly interpolate κ along clothoids; for line/arc the
     two values are equal. Setup work (arc sweep, spiral rotation) is
-    precomputed once per segment.
+    precomputed once per segment. The cumulative-end array lets callers use
+    :func:`_locate_walker` to find the containing walker in O(log N) instead
+    of scanning every station linearly.
     """
     walkers: list[tuple] = []
+    cum: list[float] = []
+    total = 0.0
     for idx, seg in enumerate(alignment.segments):
         desc = (getattr(seg, "desc", None) or "") if hasattr(seg, "desc") else ""
         if isinstance(seg, LineSeg):
@@ -556,6 +581,8 @@ def _segment_walkers(alignment: Alignment) -> list[tuple]:
                 (lambda s, seg=seg: _line_pose(seg, s)),
                 "line", "", 0.0, 0.0, desc, idx,
             ))
+            total += length
+            cum.append(total)
         elif isinstance(seg, CurveSeg):
             setup = _arc_geometry(seg)
             _, _, r, _, dtheta, length = setup
@@ -567,6 +594,8 @@ def _segment_walkers(alignment: Alignment) -> list[tuple]:
                 (lambda s, setup=setup: _arc_pose(setup, s)),
                 "curve", "", k, k, desc, idx,
             ))
+            total += length
+            cum.append(total)
         elif isinstance(seg, SpiralSeg):
             length = seg.length
             if length <= 0:
@@ -578,7 +607,9 @@ def _segment_walkers(alignment: Alignment) -> list[tuple]:
                 (lambda s, seg=seg, setup=setup: _spiral_pose(seg, setup, s)),
                 "spiral", (seg.spi_type or "clothoid").lower(), k0, k1, desc, idx,
             ))
-    return walkers
+            total += length
+            cum.append(total)
+    return walkers, cum
 
 
 def alignment_xy_at_station(
@@ -590,10 +621,10 @@ def alignment_xy_at_station(
     returns just (x, y) for a single station — used by the PVI and
     cross-section layer builders to place per-station point features.
     """
-    walkers = _segment_walkers(alignment)
+    walkers, cum = _segment_walkers(alignment)
     if not walkers:
         return None
-    total = sum(w[0] for w in walkers)
+    total = cum[-1]
     if total <= 0:
         return None
     sta_start = alignment.sta_start or 0.0
@@ -604,12 +635,11 @@ def alignment_xy_at_station(
         length, pose_fn, *_ = walkers[-1]
         x, y, _ = pose_fn(length)
         return (x, y)
-    for length, pose_fn, *_ in walkers:
-        if s <= length + 1e-9:
-            x, y, _ = pose_fn(max(0.0, s))
-            return (x, y)
-        s -= length
-    return None
+    i = _locate_walker(cum, s)
+    length, pose_fn, *_ = walkers[i]
+    local_s = max(0.0, s - (cum[i - 1] if i > 0 else 0.0))
+    x, y, _ = pose_fn(local_s)
+    return (x, y)
 
 
 def alignment_chainage(
@@ -630,10 +660,10 @@ def alignment_chainage(
     if interval <= 0:
         return []
 
-    walkers = _segment_walkers(alignment)
+    walkers, cum = _segment_walkers(alignment)
     if not walkers:
         return []
-    total = sum(w[0] for w in walkers)
+    total = cum[-1]
     if total <= 0:
         return []
 
@@ -649,16 +679,12 @@ def alignment_chainage(
             x, y, bearing = pose_fn(length)
             k = k1
         else:
-            for length, pose_fn, kind, ttype, k0, k1, desc, idx in walkers:
-                if s <= length + 1e-9:
-                    local_s = max(0.0, s)
-                    x, y, bearing = pose_fn(local_s)
-                    t = local_s / length if length > 0 else 0.0
-                    k = k0 + (k1 - k0) * t
-                    break
-                s -= length
-            else:  # pragma: no cover — guarded by the cumulative-length checks above
-                return None
+            i = _locate_walker(cum, s)
+            length, pose_fn, kind, ttype, k0, k1, desc, idx = walkers[i]
+            local_s = max(0.0, s - (cum[i - 1] if i > 0 else 0.0))
+            x, y, bearing = pose_fn(local_s)
+            t = local_s / length if length > 0 else 0.0
+            k = k0 + (k1 - k0) * t
         radius = (1.0 / k) if abs(k) > 1e-12 else None
         return ChainagePoint(
             station=station,

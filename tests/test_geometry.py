@@ -12,9 +12,11 @@ sys.path.insert(0, str(ROOT))
 from plugin.geometry_builder import (  # noqa: E402
     ArcPiece,
     LinePiece,
+    _locate_walker,
     alignment_chainage,
     alignment_curve_pieces,
     alignment_polyline,
+    alignment_xy_at_station,
     arc_points,
     line_points,
     segment_curve_pieces,
@@ -474,6 +476,39 @@ def test_spiral_with_infinite_radii_yields_single_piece():
     )
     triples = spiral_arc_triples(seg)
     assert len(triples) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cumulative-length index for the segment walker
+# ---------------------------------------------------------------------------
+def test_locate_walker_picks_first_walker_whose_cum_end_covers_s():
+    # Three back-to-back segments of length 10, 20, 30 → cum = [10, 30, 60].
+    cum = [10.0, 30.0, 60.0]
+    # Strictly inside each segment.
+    assert _locate_walker(cum, 5.0) == 0
+    assert _locate_walker(cum, 15.0) == 1
+    assert _locate_walker(cum, 45.0) == 2
+    # On a boundary: bisect_left places s == cum[i] at walker i (not i+1),
+    # matching the original linear-scan semantics.
+    assert _locate_walker(cum, 10.0) == 0
+    assert _locate_walker(cum, 30.0) == 1
+    # Past the end clamps to the last walker.
+    assert _locate_walker(cum, 60.0) == 2
+    assert _locate_walker(cum, 100.0) == 2
+    # Before the start clamps to walker 0.
+    assert _locate_walker(cum, -1.0) == 0
+
+
+def test_alignment_xy_at_segment_boundary_matches_segment_end():
+    # Build a kinked alignment so that the station at the join is unambiguous.
+    line_a = LineSeg(start=(0.0, 0.0), end=(0.0, 100.0))   # +E 100 m
+    line_b = LineSeg(start=(0.0, 100.0), end=(50.0, 100.0))  # +N 50 m
+    a = Alignment(name="K", length=150.0, sta_start=0.0, segments=[line_a, line_b])
+    # Exactly at the boundary station — the index-based locator must return
+    # the join point, not somewhere mid-segment.
+    xy = alignment_xy_at_station(a, 100.0)
+    assert xy is not None
+    assert _close(xy, (100.0, 0.0))
 
 
 def test_alignment_curve_pieces_joins_segments():
