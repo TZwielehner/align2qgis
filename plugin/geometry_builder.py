@@ -779,6 +779,220 @@ def alignment_xy_at_station(
     return (x, y)
 
 
+# ---------------------------------------------------------------------------
+# Projection — closest-point-on-alignment for the Processing tools.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProjectionResult:
+    """Closest-point projection of an external point onto an alignment.
+
+    ``offset_signed`` follows the left-positive convention: positive values
+    lie on the left of the forward (chainage-increasing) direction. The
+    residual is the unsigned distance from the point to the foot — equal
+    to ``abs(offset_signed)`` except in degenerate cases (zero-length
+    segment, point exactly on the curve).
+    """
+
+    station_display: float
+    station_internal: float
+    offset_signed: float
+    residual: float
+    seg_index: int
+    foot_x: float
+    foot_y: float
+
+
+def _project_to_line_piece(
+    piece: LinePiece, px: float, py: float,
+) -> tuple[float, float, float, float, float]:
+    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a line piece."""
+    sx, sy = piece.start
+    ex, ey = piece.end
+    dx, dy = ex - sx, ey - sy
+    L = math.hypot(dx, dy)
+    if L < 1e-12:
+        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+    tx, ty = dx / L, dy / L
+    s = (px - sx) * tx + (py - sy) * ty
+    s_clamped = max(0.0, min(L, s))
+    fx = sx + s_clamped * tx
+    fy = sy + s_clamped * ty
+    offset_signed = (px - fx) * (-ty) + (py - fy) * tx
+    residual = math.hypot(px - fx, py - fy)
+    return (s_clamped, offset_signed, fx, fy, residual)
+
+
+def _project_to_curve_seg(
+    seg: CurveSeg, px: float, py: float,
+) -> tuple[float, float, float, float, float]:
+    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a circular arc."""
+    cx, cy, r, a0, dtheta, L = _arc_geometry(seg)
+    if L <= 0 or r <= 0:
+        sx, sy = ne_to_xy(seg.start)
+        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+    abs_sweep = abs(dtheta)
+    sign = 1.0 if dtheta >= 0 else -1.0
+    a_p = math.atan2(py - cy, px - cx)
+    # CCW angular distance from a0 to a_p, in [0, 2π).
+    ccw_delta = (a_p - a0) % (2 * math.pi)
+    # Convert to the arc's sweep direction.
+    forward_delta = ccw_delta if sign > 0 else (-ccw_delta) % (2 * math.pi)
+    if forward_delta <= abs_sweep + 1e-12:
+        t = forward_delta / abs_sweep
+    else:
+        # Point falls in the angular gap between the arc end and arc start
+        # going around the unswept side; foot is whichever endpoint is
+        # closer along the gap.
+        past_end = forward_delta - abs_sweep
+        gap = 2 * math.pi - abs_sweep
+        t = 1.0 if past_end < gap / 2.0 else 0.0
+    s_local = t * L
+    a_foot = a0 + dtheta * t
+    fx = cx + r * math.cos(a_foot)
+    fy = cy + r * math.sin(a_foot)
+    rad_x, rad_y = math.cos(a_foot), math.sin(a_foot)
+    if sign > 0:
+        tx, ty = -rad_y, rad_x
+    else:
+        tx, ty = rad_y, -rad_x
+    offset_signed = (px - fx) * (-ty) + (py - fy) * tx
+    residual = math.hypot(px - fx, py - fy)
+    return (s_local, offset_signed, fx, fy, residual)
+
+
+def _project_to_spiral_seg(
+    seg: SpiralSeg, px: float, py: float, n_sweep: int = 24,
+) -> tuple[float, float, float, float, float]:
+    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a clothoid.
+
+    No closed-form inversion exists for the Fresnel integrals; we coarse-
+    sweep ``n_sweep`` candidates over ``[0, L]`` to seed a golden-section
+    minimization. The seed is exact enough that ~40 golden-section steps
+    converge to sub-millimetre precision on typical road radii.
+    """
+    L = seg.length
+    if L <= 0:
+        sx, sy = ne_to_xy(seg.start)
+        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+    setup = _spiral_setup(seg)
+
+    def dist_sq(s: float) -> float:
+        x, y, _ = _spiral_pose(seg, setup, s)
+        return (x - px) ** 2 + (y - py) ** 2
+
+    best_s = 0.0
+    best_d = dist_sq(0.0)
+    for i in range(1, n_sweep + 1):
+        s = L * i / n_sweep
+        d = dist_sq(s)
+        if d < best_d:
+            best_d = d
+            best_s = s
+    step = L / n_sweep
+    lo = max(0.0, best_s - step)
+    hi = min(L, best_s + step)
+    inv_phi = 2.0 / (1.0 + math.sqrt(5.0))
+    a = hi - inv_phi * (hi - lo)
+    b = lo + inv_phi * (hi - lo)
+    fa, fb = dist_sq(a), dist_sq(b)
+    for _ in range(50):
+        if fa < fb:
+            hi, b, fb = b, a, fa
+            a = hi - inv_phi * (hi - lo)
+            fa = dist_sq(a)
+        else:
+            lo, a, fa = a, b, fb
+            b = lo + inv_phi * (hi - lo)
+            fb = dist_sq(b)
+        if hi - lo < 1e-9:
+            break
+    s_opt = 0.5 * (lo + hi)
+    fx, fy, bearing_deg = _spiral_pose(seg, setup, s_opt)
+    bearing = math.radians(bearing_deg)
+    tx, ty = math.cos(bearing), math.sin(bearing)
+    offset_signed = (px - fx) * (-ty) + (py - fy) * tx
+    residual = math.hypot(px - fx, py - fy)
+    return (s_opt, offset_signed, fx, fy, residual)
+
+
+def alignment_project_point(
+    alignment: Alignment, px: float, py: float,
+) -> ProjectionResult | None:
+    """Project ``(px, py)`` onto ``alignment`` and return the closest match.
+
+    Walks every segment, projects onto each, and keeps the foot with the
+    smallest residual. Station values follow the equation map (``station``
+    is the displayed value; ``station_internal`` is the continuous
+    arclength coordinate).
+    """
+    sta_start = alignment.sta_start or 0.0
+    cum = sta_start
+    best_residual = math.inf
+    best: ProjectionResult | None = None
+    for idx, seg in enumerate(alignment.segments):
+        L = segment_length(seg)
+        if L <= 0:
+            continue
+        if isinstance(seg, LineSeg):
+            sx, sy = ne_to_xy(seg.start)
+            ex, ey = ne_to_xy(seg.end)
+            piece = LinePiece((sx, sy), (ex, ey))
+            s_local, off, fx, fy, res = _project_to_line_piece(piece, px, py)
+        elif isinstance(seg, CurveSeg):
+            s_local, off, fx, fy, res = _project_to_curve_seg(seg, px, py)
+        elif isinstance(seg, SpiralSeg):
+            s_local, off, fx, fy, res = _project_to_spiral_seg(seg, px, py)
+        else:
+            cum += L
+            continue
+        if res < best_residual:
+            best_residual = res
+            station_internal = cum + s_local
+            station_display = internal_to_display(alignment, station_internal)
+            best = ProjectionResult(
+                station_display=station_display,
+                station_internal=station_internal,
+                offset_signed=off,
+                residual=res,
+                seg_index=idx,
+                foot_x=fx,
+                foot_y=fy,
+            )
+        cum += L
+    return best
+
+
+def alignment_pose_at_station(
+    alignment: Alignment, station_display: float,
+) -> tuple[float, float, float] | None:
+    """``(x, y, bearing_deg)`` at the given *displayed* station, or None.
+
+    Used by the inverse processing algorithm (point-from-station+offset)
+    to compute the perpendicular offset. ``bearing_deg`` is math
+    convention (CCW from east), consumed by callers that apply
+    ``(x', y') = (x - offset·sin(b), y + offset·cos(b))`` for left-positive
+    offset.
+    """
+    internal = display_to_internal(alignment, station_display)
+    if internal is None:
+        return None
+    walkers, cum_arr = _segment_walkers(alignment)
+    if not walkers:
+        return None
+    total = cum_arr[-1]
+    sta_start = alignment.sta_start or 0.0
+    s = internal - sta_start
+    if s < -1e-6 or s > total + 1e-6:
+        return None
+    if s >= total:
+        length, pose_fn, *_ = walkers[-1]
+        return pose_fn(length)
+    i = _locate_walker(cum_arr, s)
+    length, pose_fn, *_ = walkers[i]
+    local_s = max(0.0, s - (cum_arr[i - 1] if i > 0 else 0.0))
+    return pose_fn(local_s)
+
+
 def alignment_chainage(
     alignment: Alignment,
     interval: float,
