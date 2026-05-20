@@ -1,10 +1,11 @@
 """Lazy LandXML → ``list[Alignment]`` resolver keyed by source path + mtime.
 
-The Processing algorithms get a ``QgsVectorLayer`` (the plugin's Alignments
-layer) and need the original :class:`~plugin.landxml_parser.Alignment`
-dataclasses to do spiral-aware projection. Re-parsing the LandXML on every
-algorithm invocation is wasteful — and the same file is typically the
-source for many input points — so cache by ``(path, mtime)`` and invalidate
+Callers (Processing algorithms, the profile dock) get a ``QgsVectorLayer``
+created by Align2QGIS and need the original
+:class:`~plugin.landxml_parser.Alignment` dataclasses to do spiral-aware
+projection, equation lookup, or vertical-curve analysis. Re-parsing the
+LandXML on every invocation is wasteful — and the same file is typically
+the source for many queries — so cache by ``(path, mtime)`` and invalidate
 on file changes.
 """
 from __future__ import annotations
@@ -13,8 +14,8 @@ import os
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
-from ..constants import PROP_SOURCE_PATH
-from ..landxml_parser import Alignment, parse_alignments_with_meta
+from .constants import PROP_SOURCE_PATH
+from .landxml_parser import Alignment, parse_alignments_with_meta
 
 if TYPE_CHECKING:
     from qgis.core import QgsVectorLayer

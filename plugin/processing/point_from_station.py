@@ -27,7 +27,7 @@ from ..geometry_builder import (
     internal_to_display,
 )
 from ..landxml_parser import profile_elevation_at_station
-from ._alignment_cache import alignments_by_name
+from ..alignment_cache import alignments_by_name
 
 
 class PointFromStationOffsetAlgorithm(QgsProcessingAlgorithm):
