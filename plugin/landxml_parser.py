@@ -93,6 +93,25 @@ class SpiralSeg:
 Segment = LineSeg | CurveSeg | SpiralSeg
 
 
+@dataclass(frozen=True)
+class StaEquation:
+    """One ``<StaEquation>`` child of an ``<Alignment>``.
+
+    LandXML semantics: ``sta_internal`` is the alignment's *continuous*
+    station coordinate at the equation point (defaulting to ``sta_back``
+    when the attribute is omitted). ``sta_back`` is the displayed station
+    just before the equation; ``sta_ahead`` is the displayed station just
+    after. A forward equation (``sta_ahead > sta_back``) introduces a gap
+    in the displayed station axis; a back equation (``sta_ahead <
+    sta_back``) creates an overlap where two displayed station values
+    refer to a single internal point.
+    """
+
+    sta_back: float
+    sta_ahead: float
+    sta_internal: float
+
+
 @dataclass
 class PVI:
     """Point of Vertical Intersection — a vertex in the vertical alignment."""
@@ -140,6 +159,9 @@ class Alignment:
     # Best-effort track number lifted from <Feature name="...track..."> children
     # of <Alignment>; falls back to a 3-5 digit run found in the alignment name.
     track_number: str | None = None
+    # Station equations (``<StaEquation>`` children), sorted by ``sta_internal``.
+    # Empty when the alignment has continuous stationing.
+    equations: list[StaEquation] = field(default_factory=list)
 
 
 @dataclass
@@ -313,6 +335,41 @@ def _parse_profile_item(elem: ET.Element) -> ProfileItem | None:
     return None
 
 
+def _parse_station_equations(alignment_elem: ET.Element) -> list[StaEquation]:
+    """Collect ``<StaEquation>`` children, defaulting ``staInternal`` to ``staBack``.
+
+    Equations are returned sorted by ``sta_internal`` so the downstream
+    map-builder doesn't have to re-sort. LandXML places ``<StaEquation>``
+    as a direct child of ``<Alignment>`` (occasionally inside
+    ``<CoordGeom>``), so we accept both.
+    """
+    out: list[StaEquation] = []
+    for child in alignment_elem.iter():
+        if _strip_ns(child.tag) != "StaEquation":
+            continue
+        back_attr = child.attrib.get("staBack")
+        ahead_attr = child.attrib.get("staAhead")
+        if back_attr is None or ahead_attr is None:
+            continue
+        try:
+            sta_back = float(back_attr)
+            sta_ahead = float(ahead_attr)
+        except ValueError:
+            continue
+        internal_attr = child.attrib.get("staInternal")
+        try:
+            sta_internal = float(internal_attr) if internal_attr else sta_back
+        except ValueError:
+            sta_internal = sta_back
+        out.append(
+            StaEquation(
+                sta_back=sta_back, sta_ahead=sta_ahead, sta_internal=sta_internal
+            )
+        )
+    out.sort(key=lambda e: e.sta_internal)
+    return out
+
+
 def _parse_profile(elem: ET.Element) -> Profile:
     profile = Profile(name=elem.attrib.get("name") or "", alignments=[])
     for prof_align_elem in elem:
@@ -349,6 +406,101 @@ _INSPECT_TAGS = (
     "Project",
     "Application",
 )
+
+
+_PROFILE_ITEMS_CACHE_ATTR = "_align2qgis_profile_items_cache"
+
+
+def _profile_items_sorted(profile: Profile) -> list:
+    """Flatten all ProfAlign elements into one sorted list keyed by station.
+
+    Result is cached on the Profile via a private attribute so the hot
+    elevation-lookup path doesn't re-sort on every vertex.
+    """
+    cached_alignments = getattr(profile, _PROFILE_ITEMS_CACHE_ATTR, None)
+    if cached_alignments is not None and cached_alignments[0] is profile.alignments:
+        return cached_alignments[1]
+    items = []
+    for prof_align in profile.alignments:
+        items.extend(prof_align.elements)
+    items.sort(key=lambda x: x.station)
+    try:
+        object.__setattr__(profile, _PROFILE_ITEMS_CACHE_ATTR, (profile.alignments, items))
+    except (AttributeError, TypeError):
+        pass
+    return items
+
+
+def _grade_between(items: list, i_left: int, i_right: int) -> float:
+    if i_left < 0 or i_right >= len(items):
+        return 0.0
+    dx = items[i_right].station - items[i_left].station
+    if abs(dx) < 1e-9:
+        return 0.0
+    return (items[i_right].elev - items[i_left].elev) / dx
+
+
+def profile_elevation_at_station(
+    profile: Profile | None, station: float,
+) -> float | None:
+    """Closed-form elevation at ``station`` along ``profile``.
+
+    Evaluates the parabolic vertical curve when ``station`` falls inside a
+    ``<ParaCurve>`` / ``<CircCurve>`` / ``<UnsymParaCurve>`` span, and
+    linearly interpolates between adjacent tangent endpoints otherwise.
+    Returns ``None`` when the station is outside the profile's range.
+
+    ``station`` is interpreted in the same coordinate system the profile's
+    items use — typically the alignment's *displayed* stations, so callers
+    holding an alignment-internal value should run it through
+    :func:`internal_to_display` first.
+
+    Mirrors the math in :func:`profile_samples` (which densifies the same
+    profile at fixed step) so the two stay numerically consistent.
+    """
+    if profile is None:
+        return None
+    items = _profile_items_sorted(profile)
+    if not items:
+        return None
+    n = len(items)
+    s = station
+
+    # Inside a vertical curve?
+    for i, item in enumerate(items):
+        if not (isinstance(item, VertCurve) and item.length > 0):
+            continue
+        L = item.length
+        sta_bvc = item.station - L / 2.0
+        sta_evc = item.station + L / 2.0
+        if sta_bvc - 1e-9 <= s <= sta_evc + 1e-9:
+            g_back = _grade_between(items, i - 1, i) if i > 0 else 0.0
+            g_ahead = _grade_between(items, i, i + 1) if i < n - 1 else 0.0
+            elev_bvc = item.elev - (L / 2.0) * g_back
+            ds = s - sta_bvc
+            return elev_bvc + g_back * ds + (g_ahead - g_back) / (2.0 * L) * ds * ds
+
+    # On a tangent between two items — each item's tangent endpoint sits on
+    # the connecting tangent at BVC/EVC distance from its PVI station.
+    for i in range(n - 1):
+        cur, nxt = items[i], items[i + 1]
+        L_cur = cur.length if isinstance(cur, VertCurve) and cur.length > 0 else 0.0
+        L_nxt = nxt.length if isinstance(nxt, VertCurve) and nxt.length > 0 else 0.0
+        sta_l = cur.station + L_cur / 2.0
+        sta_r = nxt.station - L_nxt / 2.0
+        if sta_l - 1e-9 <= s <= sta_r + 1e-9:
+            if sta_r - sta_l < 1e-9:
+                return cur.elev
+            g = (nxt.elev - cur.elev) / (nxt.station - cur.station)
+            elev_l = cur.elev + (L_cur / 2.0) * g
+            return elev_l + (s - sta_l) * g
+
+    # Boundary stations exactly at the first/last item.
+    if abs(s - items[0].station) < 1e-9:
+        return items[0].elev
+    if abs(s - items[-1].station) < 1e-9:
+        return items[-1].elev
+    return None
 
 
 def profile_samples(
@@ -512,6 +664,7 @@ def parse_alignments_with_meta(
             segments = list(_iter_coord_geom(coord_geom))
         profile_elem = _child(alignments_node, "Profile")
         profile = _parse_profile(profile_elem) if profile_elem is not None else None
+        equations = _parse_station_equations(alignments_node)
         alignments.append(
             Alignment(
                 name=name,
@@ -520,6 +673,7 @@ def parse_alignments_with_meta(
                 segments=segments,
                 profile=profile,
                 track_number=_extract_track_number(alignments_node, name),
+                equations=equations,
             )
         )
     return alignments, meta

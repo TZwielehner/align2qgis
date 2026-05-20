@@ -1,16 +1,22 @@
 # align2qgis
 
 QGIS 3 plugin: import LandXML horizontal alignments (lines, circular arcs,
-clothoid spirals) as a memory line layer.
+clothoid spirals) as a native curved-geometry layer.
 
 ## What it handles
 
 | LandXML element            | Method                                                       |
 | -------------------------- | ------------------------------------------------------------ |
 | `<Line>`                   | Straight segment, two points.                                |
-| `<Curve rot="cw\|ccw">`    | Exact circular-arc math from `Start`, `Center`, `End`.       |
-| `<Spiral spiType="clothoid">` | Numerical integration of θ(s) = k₀s + (k₁−k₀)s²/(2L). |
+| `<Curve rot="cw\|ccw">`    | Exact circular-arc math from `Start`, `Center`, `End`, emitted as a `CircularString` sub-curve. |
+| `<Spiral spiType="clothoid">` | Numerical integration of θ(s) = k₀s + (k₁−k₀)s²/(2L), then discretized into a chain of circular arcs (per-arc chord error ≤ 1 cm by default). |
 | Anything else              | Skipped with a warning in the QGIS log.                      |
+
+Geometry: each alignment is emitted as a `CompoundCurve` of line +
+circular-arc sub-curves, so QGIS' offset / buffer / length operations use
+the analytic curve rather than a chord polyline. This matters when
+deriving lane edges or parallel features at significant offsets — the
+polyline approach produces visible faceting that the arc chain avoids.
 
 Coordinates: LandXML stores points as `Northing Easting [Elevation]`.
 The plugin swaps to QGIS axis order (x = Easting, y = Northing) in
@@ -18,6 +24,15 @@ The plugin swaps to QGIS axis order (x = Easting, y = Northing) in
 asks for one (`EPSG:25832` is offered by default; for AT/DE rail data this is
 often `EPSG:31256`, `EPSG:31287`, or a project-specific Gauß-Krüger zone —
 check the survey report).
+
+## Compatibility
+
+Targets QGIS 3.22+ and QGIS 4 (Qt6). The codebase uses the `qgis.PyQt`
+shim, `QMetaType.Type` field types, and the `Qgis.*` enum forms
+(`Qgis.MessageLevel`, `Qgis.MarkerShape`) so the same source works
+against both PyQt5 and PyQt6 builds. `QgsCompoundCurve` instances are
+wrapped via `QgsGeometry(cc.clone())` for unambiguous ownership transfer
+under QGIS 4's stricter SIP bindings.
 
 ## Install in QGIS
 
@@ -45,15 +60,38 @@ check the survey report).
    `<Alignment>`. Attributes: `name`, `length_xml`, `length_geom`,
    `sta_start`, `n_segments`.
 
+## Processing Toolbox
+
+Under *Processing Toolbox → Align2QGIS*:
+
+- **Station from point** — project an external point layer onto the
+  alignment and emit `(alignment_name, station, offset_signed, side)`
+  per input feature. Offset is signed left-positive of the
+  chainage-increasing direction. Skips points whose projection
+  exceeds the configurable maximum offset.
+- **Point from station and offset** — inverse direction: read a table
+  with `alignment_name`, `station`, `offset` and place a point at the
+  resolved map location. Z comes from the LandXML `<Profile>` when
+  the source alignment carries one; offset is planar only.
+
+Both algorithms read the original LandXML behind the Alignments layer
+(via its `align2qgis/source_path` custom property) so projection is
+spiral-aware rather than running against the rendered chord polyline.
+
 ## CLI sanity-check (no QGIS required)
 
-`tools/dump_alignment.py` parses a LandXML file and prints WKT for each
-alignment so you can paste into QGIS via *Layer → Add Layer → Add Delimited
-Text Layer* or load with any GIS tool:
+`tools/dump_alignment.py` parses a LandXML file and prints `COMPOUNDCURVE`
+WKT for each alignment — circular arcs stay as analytic `CIRCULARSTRING`
+sub-pieces and clothoids as arc chains, matching what the plugin loads
+into QGIS:
 
 ```
 python3 tools/dump_alignment.py path/to/file.xml > alignments.wkt
+python3 tools/dump_alignment.py --3d path/to/file.xml > alignments_z.wkt
 ```
+
+The `--3d` flag pulls elevations from the LandXML `<Profile>` (when
+present) and emits `COMPOUNDCURVE Z`.
 
 ## Tests
 
@@ -63,15 +101,17 @@ python3 -m unittest discover -s tests
 python3 -c "import tests.test_geometry as t; [getattr(t,n)() for n in dir(t) if n.startswith('test_')]"
 ```
 
-7 tests cover the parser, axis swap, both arc sweep directions, the
-infinite-radius spiral edge case, and a Fresnel cross-check at the spiral
-mid-point.
+Tests cover the parser, axis swap, both arc sweep directions, the
+infinite-radius spiral edge case, a Fresnel cross-check at the spiral
+mid-point, the clothoid → arc-chain discretization (endpoint matching +
+per-arc chord error within budget), and the chainage walker.
 
 ## Known limits
 
-- No vertical alignment / profile yet — only `<CoordGeom>` is consumed.
 - `<IrregularLine>`, `<Chain>`, station equations: not handled.
-- The clothoid is integrated with a trapezoidal rule (~0.5 samples/m
-  default). Discretization error grows with spiral length; pin endpoints
-  is applied automatically so the polyline lands exactly on `<End>`.
+- Clothoid arc-discretization is driven by `|dκ/ds|·h³/24 ≤ ε` with
+  ε = 1 cm. The chain's outer endpoints are still pinned to the LandXML
+  `<Start>` / `<End>` to absorb integration drift on long spirals — a
+  geometrically inconsistent LandXML end will be honoured rather than
+  corrected.
 - CRS must be supplied by the user; LandXML provides none.

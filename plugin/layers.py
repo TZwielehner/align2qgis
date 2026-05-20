@@ -14,10 +14,14 @@ import re
 
 from qgis.PyQt.QtCore import QMetaType
 from qgis.core import (
+    QgsCircularString,
+    QgsCompoundCurve,
     QgsCoordinateReferenceSystem,
     QgsFeature,
     QgsField,
     QgsGeometry,
+    QgsLineString,
+    QgsPoint,
     QgsPointXY,
     QgsVectorLayer,
 )
@@ -25,14 +29,24 @@ from qgis.core import (
 from .constants import PROP_CRS, PROP_SOURCE_PATH, SOURCE_FILE_FIELD
 from .dimensions import build_dimensions
 from .geometry_builder import (
+    ArcPiece,
+    LinePiece,
     alignment_chainage,
-    alignment_polyline,
+    alignment_curve_pieces,
+    alignment_curve_pieces_3d,
     alignment_xy_at_station,
+    internal_to_display,
     segment_curvature,
+    segment_curve_pieces,
     segment_length,
-    segment_points,
 )
-from .landxml_parser import CurveSeg, LandXMLMetadata, SpiralSeg, VertCurve
+from .landxml_parser import (
+    CurveSeg,
+    LandXMLMetadata,
+    SpiralSeg,
+    VertCurve,
+    profile_elevation_at_station,
+)
 from .stationing import format_station, upright_bearing
 
 
@@ -66,6 +80,89 @@ def _new_memory_layer(
     return layer
 
 
+def _compound_curve_from_pieces(pieces) -> QgsCompoundCurve:
+    """Build a QgsCompoundCurve from a list of LinePiece / ArcPiece values.
+
+    Lines become two-point ``QgsLineString`` sub-curves; arcs become
+    three-point ``QgsCircularString`` sub-curves. QGIS stores this as native
+    curved geometry — offsets, buffers, and length() use the analytic
+    formulas rather than the chord polyline.
+    """
+    cc = QgsCompoundCurve()
+    for piece in pieces:
+        if isinstance(piece, LinePiece):
+            cc.addCurve(QgsLineString([
+                QgsPoint(*piece.start), QgsPoint(*piece.end),
+            ]))
+        elif isinstance(piece, ArcPiece):
+            cc.addCurve(QgsCircularString(
+                QgsPoint(*piece.start),
+                QgsPoint(*piece.mid),
+                QgsPoint(*piece.end),
+            ))
+    return cc
+
+
+def _compound_curve_from_pieces_with_z(
+    pieces_with_z: list[tuple[object, list[float]]],
+) -> QgsCompoundCurve:
+    """3D counterpart of :func:`_compound_curve_from_pieces`.
+
+    Each entry pairs a curve piece with a per-vertex Z list (2 entries for
+    a LinePiece, 3 for an ArcPiece). Z is taken verbatim — callers fall
+    back to 0.0 when no profile elevation is available.
+    """
+    cc = QgsCompoundCurve()
+    for piece, zs in pieces_with_z:
+        if isinstance(piece, LinePiece):
+            cc.addCurve(QgsLineString([
+                QgsPoint(piece.start[0], piece.start[1], zs[0]),
+                QgsPoint(piece.end[0], piece.end[1], zs[1]),
+            ]))
+        elif isinstance(piece, ArcPiece):
+            cc.addCurve(QgsCircularString(
+                QgsPoint(piece.start[0], piece.start[1], zs[0]),
+                QgsPoint(piece.mid[0], piece.mid[1], zs[1]),
+                QgsPoint(piece.end[0], piece.end[1], zs[2]),
+            ))
+    return cc
+
+
+def _elev_at_internal(alignment, s_internal: float) -> float:
+    """Look up profile elevation at an alignment-internal station.
+
+    Converts through the equation map (display↔internal) and returns 0.0
+    when the alignment has no profile or the station is outside the
+    profile's range — the layer-level Z=0 fallback documented at each
+    builder.
+    """
+    profile = getattr(alignment, "profile", None)
+    if profile is None:
+        return 0.0
+    s_display = internal_to_display(alignment, s_internal)
+    z = profile_elevation_at_station(profile, s_display)
+    return 0.0 if z is None else float(z)
+
+
+def _pieces_with_z(alignment, max_chord_err: float = 0.01):
+    """``alignment_curve_pieces_3d`` results with Z resolved per vertex."""
+    out = []
+    for piece, stations in alignment_curve_pieces_3d(alignment, max_chord_err):
+        zs = [_elev_at_internal(alignment, s) for s in stations]
+        out.append((piece, zs))
+    return out
+
+
+def _batch_is_3d(alignments) -> bool:
+    """A layer goes 3D when *any* alignment in the batch carries a profile.
+
+    QGIS layers carry a single geometry type, so we can't mix 2D and 3D
+    features in one layer — when at least one alignment has elevations we
+    promote the whole layer and give profileless alignments a Z=0 fallback.
+    """
+    return any(getattr(a, "profile", None) is not None for a in alignments)
+
+
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
@@ -79,18 +176,42 @@ def build_alignment_layer(
     imported_at: str = "",
     metadata: LandXMLMetadata | None = None,
 ) -> QgsVectorLayer:
-    """One polyline feature per alignment — the rendered horizontal curve."""
+    """One CompoundCurve feature per alignment — the rendered horizontal curve.
+
+    Lines stay as line segments and arcs/spirals are emitted as native
+    circular-arc sub-curves so QGIS renders, offsets, and measures them
+    analytically rather than as chord polylines. When *any* alignment in
+    the batch has a ``<Profile>``, the layer is promoted to
+    ``CompoundCurveZ`` and Z is sampled from the profile at every vertex;
+    profile-less alignments get a Z=0 fallback so the layer's geometry
+    type stays uniform.
+    """
+    is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
-        layer_name, crs_authid, "LineString", alignment_fields(),
+        layer_name, crs_authid,
+        "CompoundCurveZ" if is_3d else "CompoundCurve",
+        alignment_fields(),
     )
     meta = metadata or LandXMLMetadata()
 
     features: list[QgsFeature] = []
     for alignment in alignments:
-        pts = alignment_polyline(alignment)
-        if len(pts) < 2:
+        if is_3d:
+            pieces_with_z = _pieces_with_z(alignment)
+            if not pieces_with_z:
+                continue
+            cc = _compound_curve_from_pieces_with_z(pieces_with_z)
+        else:
+            pieces = alignment_curve_pieces(alignment)
+            if not pieces:
+                continue
+            cc = _compound_curve_from_pieces(pieces)
+        if cc.nCurves() == 0:
             continue
-        geom = QgsGeometry.fromPolylineXY([QgsPointXY(x, y) for x, y in pts])
+        # ``QgsGeometry(cc)`` would transfer ownership of ``cc``; the
+        # ``.clone()`` keeps that transfer unambiguous under QGIS 4's SIP
+        # bindings without affecting QGIS 3 behaviour.
+        geom = QgsGeometry(cc.clone())
         feat = QgsFeature(layer.fields())
         feat.setGeometry(geom)
         feat.setAttribute("name", alignment.name)
@@ -155,22 +276,63 @@ def build_segment_layer(
     *,
     source_file: str = "",
 ) -> QgsVectorLayer:
-    """One polyline feature per LandXML segment (Line / Curve / Spiral)."""
+    """One CompoundCurve feature per LandXML segment (Line / Curve / Spiral).
+
+    Circular arcs are emitted exactly; clothoid spirals are discretized into
+    a chain of circular arcs whose chord deviation from the true clothoid
+    stays under a centimeter for typical road geometry. Promoted to
+    ``CompoundCurveZ`` when any alignment in the batch carries a profile;
+    Z is sampled per vertex, Z=0 for profile-less alignments.
+    """
+    is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
-        layer_name, crs_authid, "LineString", segment_fields(),
+        layer_name, crs_authid,
+        "CompoundCurveZ" if is_3d else "CompoundCurve",
+        segment_fields(),
     )
 
     features: list[QgsFeature] = []
     for alignment in alignments:
         sta = alignment.sta_start or 0.0
+        # Bucket the alignment-wide 3D pieces back to their source segments
+        # so each segment feature gets its own contiguous slice; reuses the
+        # canonical station math in :func:`alignment_curve_pieces_3d`
+        # rather than re-deriving it inline.
+        pieces_with_z_by_seg: dict[int, list[tuple[object, list[float]]]] = {}
+        if is_3d:
+            all_pieces = alignment_curve_pieces_3d(alignment)
+            seg_arclengths = [segment_length(s) for s in alignment.segments]
+            seg_ends = []
+            acc = sta
+            for L in seg_arclengths:
+                acc += L
+                seg_ends.append(acc)
+            seg_idx = 0
+            for piece, stations in all_pieces:
+                # Advance to the segment whose end station covers this piece's end.
+                piece_end = stations[-1]
+                while seg_idx < len(seg_ends) - 1 and piece_end > seg_ends[seg_idx] + 1e-6:
+                    seg_idx += 1
+                pieces_with_z_by_seg.setdefault(seg_idx, []).append(
+                    (piece, [_elev_at_internal(alignment, s) for s in stations])
+                )
         for idx, seg in enumerate(alignment.segments):
             length = segment_length(seg)
             if length <= 0:
                 continue
-            pts = segment_points(seg)
-            if len(pts) < 2:
+            if is_3d:
+                pwz = pieces_with_z_by_seg.get(idx, [])
+                if not pwz:
+                    continue
+                cc = _compound_curve_from_pieces_with_z(pwz)
+            else:
+                pieces = segment_curve_pieces(seg)
+                if not pieces:
+                    continue
+                cc = _compound_curve_from_pieces(pieces)
+            if cc.nCurves() == 0:
                 continue
-            geom = QgsGeometry.fromPolylineXY([QgsPointXY(x, y) for x, y in pts])
+            geom = QgsGeometry(cc.clone())
 
             k_start, k_end = segment_curvature(seg)
             radius_start = (1.0 / k_start) if abs(k_start) > 1e-12 else None
@@ -221,6 +383,7 @@ def stations_fields() -> list[QgsField]:
     return [
         QgsField("alignment", QMetaType.Type.QString),
         QgsField("station", QMetaType.Type.Double),
+        QgsField("station_internal", QMetaType.Type.Double),
         QgsField("label", QMetaType.Type.QString),
         QgsField("rotation", QMetaType.Type.Double),
         QgsField("rotation_perp", QMetaType.Type.Double),
@@ -247,8 +410,13 @@ def build_stations_layer(
     Annotation stations at fixed intervals belong on the Alignments layer's
     label engine (see :func:`build_chainage_label_layer` for the auxiliary
     in-memory layer that backs them when symbol-level labeling is wanted).
+    Promoted to ``PointZ`` when any alignment carries a profile so slope
+    analyses against the alignment have a real Z column.
     """
-    layer = _new_memory_layer(layer_name, crs_authid, "Point", stations_fields())
+    is_3d = _batch_is_3d(alignments)
+    layer = _new_memory_layer(
+        layer_name, crs_authid, "PointZ" if is_3d else "Point", stations_fields(),
+    )
 
     label_offset = 90.0 if perpendicular else 0.0
     features: list[QgsFeature] = []
@@ -259,9 +427,14 @@ def build_stations_layer(
             continue
         for cp in stations:
             feat = QgsFeature(layer.fields())
-            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
+            if is_3d:
+                z = _elev_at_internal(alignment, cp.station_internal)
+                feat.setGeometry(QgsGeometry(QgsPoint(cp.x, cp.y, z)))
+            else:
+                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
             feat.setAttribute("alignment", alignment.name)
             feat.setAttribute("station", cp.station)
+            feat.setAttribute("station_internal", cp.station_internal)
             feat.setAttribute("label", format_station(cp.station))
             # QGIS rotation is CW in screen space; our bearing is math CCW
             # in map space (y-up). Negate so labels/markers align with the
@@ -299,8 +472,12 @@ def build_chainage_label_layer(
     Carries the same schema as the Stations layer so the existing station
     label/tick styling applies unchanged. Not written to the GeoPackage —
     rebuilt on every import alongside the persisted Alignments table.
+    Promoted to ``PointZ`` when any alignment carries a profile.
     """
-    layer = _new_memory_layer(layer_name, crs_authid, "Point", stations_fields())
+    is_3d = _batch_is_3d(alignments)
+    layer = _new_memory_layer(
+        layer_name, crs_authid, "PointZ" if is_3d else "Point", stations_fields(),
+    )
 
     label_offset = 90.0 if perpendicular else 0.0
     features: list[QgsFeature] = []
@@ -308,9 +485,14 @@ def build_chainage_label_layer(
         stations = alignment_chainage(alignment, interval, include_endpoints=False)
         for cp in stations:
             feat = QgsFeature(layer.fields())
-            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
+            if is_3d:
+                z = _elev_at_internal(alignment, cp.station_internal)
+                feat.setGeometry(QgsGeometry(QgsPoint(cp.x, cp.y, z)))
+            else:
+                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
             feat.setAttribute("alignment", alignment.name)
             feat.setAttribute("station", cp.station)
+            feat.setAttribute("station_internal", cp.station_internal)
             feat.setAttribute("label", format_station(cp.station))
             feat.setAttribute(
                 "rotation", upright_bearing(-(cp.bearing_deg + label_offset))
@@ -457,9 +639,17 @@ def build_cross_sections_layer(
     *,
     source_file: str = "",
 ) -> QgsVectorLayer:
-    """One point per cross-section sample. Created empty when none in file."""
+    """One point per cross-section sample. Created empty when none in file.
+
+    Promoted to ``PointZ`` when any alignment carries a profile — the
+    sample's own ``elevation`` already provides a real Z so the geometry's
+    Z matches the attribute exactly.
+    """
+    is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
-        layer_name, crs_authid, "Point", cross_sections_fields(),
+        layer_name, crs_authid,
+        "PointZ" if is_3d else "Point",
+        cross_sections_fields(),
     )
     by_name = {a.name: a for a in alignments}
     features: list[QgsFeature] = []
@@ -471,7 +661,10 @@ def build_cross_sections_layer(
         if xy is None:
             continue
         feat = QgsFeature(layer.fields())
-        feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(*xy)))
+        if is_3d:
+            feat.setGeometry(QgsGeometry(QgsPoint(xy[0], xy[1], float(cs.elevation))))
+        else:
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(*xy)))
         feat.setAttribute("alignment", cs.alignment_name)
         feat.setAttribute(SOURCE_FILE_FIELD, source_file)
         feat.setAttribute("station", cs.station)
