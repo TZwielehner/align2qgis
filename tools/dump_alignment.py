@@ -32,30 +32,22 @@ from plugin.landxml_parser import (  # noqa: E402
 )
 
 
-def _piece_to_wkt_2d(piece) -> str:
-    if isinstance(piece, LinePiece):
-        return (
-            f"({piece.start[0]:.4f} {piece.start[1]:.4f}, "
-            f"{piece.end[0]:.4f} {piece.end[1]:.4f})"
-        )
-    return (
-        f"CIRCULARSTRING({piece.start[0]:.4f} {piece.start[1]:.4f}, "
-        f"{piece.mid[0]:.4f} {piece.mid[1]:.4f}, "
-        f"{piece.end[0]:.4f} {piece.end[1]:.4f})"
-    )
+def _format_vertex(xy, z: float | None) -> str:
+    if z is None:
+        return f"{xy[0]:.4f} {xy[1]:.4f}"
+    return f"{xy[0]:.4f} {xy[1]:.4f} {z:.4f}"
 
 
-def _piece_to_wkt_3d(piece, zs: list[float]) -> str:
+def _piece_to_wkt(piece, zs: list[float] | None) -> str:
+    """``zs`` is the per-vertex Z list (2 entries for a line, 3 for an arc), or ``None`` for 2D."""
     if isinstance(piece, LinePiece):
-        return (
-            f"({piece.start[0]:.4f} {piece.start[1]:.4f} {zs[0]:.4f}, "
-            f"{piece.end[0]:.4f} {piece.end[1]:.4f} {zs[1]:.4f})"
-        )
-    return (
-        f"CIRCULARSTRING({piece.start[0]:.4f} {piece.start[1]:.4f} {zs[0]:.4f}, "
-        f"{piece.mid[0]:.4f} {piece.mid[1]:.4f} {zs[1]:.4f}, "
-        f"{piece.end[0]:.4f} {piece.end[1]:.4f} {zs[2]:.4f})"
-    )
+        v0 = _format_vertex(piece.start, zs[0] if zs else None)
+        v1 = _format_vertex(piece.end, zs[1] if zs else None)
+        return f"({v0}, {v1})"
+    v0 = _format_vertex(piece.start, zs[0] if zs else None)
+    v1 = _format_vertex(piece.mid, zs[1] if zs else None)
+    v2 = _format_vertex(piece.end, zs[2] if zs else None)
+    return f"CIRCULARSTRING({v0}, {v1}, {v2})"
 
 
 def _alignment_wkt(alignment, want_3d: bool) -> str | None:
@@ -70,13 +62,13 @@ def _alignment_wkt(alignment, want_3d: bool) -> str | None:
                 s_display = internal_to_display(alignment, s_internal)
                 z = profile_elevation_at_station(alignment.profile, s_display)
                 zs.append(0.0 if z is None else float(z))
-            chunks.append(_piece_to_wkt_3d(piece, zs))
+            chunks.append(_piece_to_wkt(piece, zs))
         return f"COMPOUNDCURVE Z ({', '.join(chunks)})"
 
     pieces = alignment_curve_pieces(alignment)
     if not pieces:
         return None
-    return f"COMPOUNDCURVE ({', '.join(_piece_to_wkt_2d(p) for p in pieces)})"
+    return f"COMPOUNDCURVE ({', '.join(_piece_to_wkt(p, None) for p in pieces)})"
 
 
 def main(argv: list[str]) -> int:

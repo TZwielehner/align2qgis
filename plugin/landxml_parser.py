@@ -408,12 +408,26 @@ _INSPECT_TAGS = (
 )
 
 
+_PROFILE_ITEMS_CACHE_ATTR = "_align2qgis_profile_items_cache"
+
+
 def _profile_items_sorted(profile: Profile) -> list:
-    """Flatten all ProfAlign elements into one sorted list keyed by station."""
+    """Flatten all ProfAlign elements into one sorted list keyed by station.
+
+    Result is cached on the Profile via a private attribute so the hot
+    elevation-lookup path doesn't re-sort on every vertex.
+    """
+    cached_alignments = getattr(profile, _PROFILE_ITEMS_CACHE_ATTR, None)
+    if cached_alignments is not None and cached_alignments[0] is profile.alignments:
+        return cached_alignments[1]
     items = []
     for prof_align in profile.alignments:
         items.extend(prof_align.elements)
     items.sort(key=lambda x: x.station)
+    try:
+        object.__setattr__(profile, _PROFILE_ITEMS_CACHE_ATTR, (profile.alignments, items))
+    except (AttributeError, TypeError):
+        pass
     return items
 
 

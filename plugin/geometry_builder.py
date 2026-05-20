@@ -185,6 +185,10 @@ def _spiral_placement(
 
     declared_sign = -1.0 if seg.rot.lower() == "cw" else 1.0
 
+    # Residual below 1 mm (or 1 mm²-ish for the unit-rotation metric) means
+    # the declared rot already lands cleanly — skip the second integration.
+    short_circuit = 1e-3
+
     best_residual = math.inf
     best: tuple[float, float, float, float, list[XY]] = (1.0, 0.0, 0.0, 0.0, [])
     for sign in (declared_sign, -declared_sign):
@@ -203,6 +207,8 @@ def _spiral_placement(
         if residual < best_residual:
             best_residual = residual
             best = (cos_a, sin_a, k0, k1, local)
+        if best_residual < short_circuit:
+            break
 
     cos_a, sin_a, k0, k1, local = best
     return (sx, sy, cos_a, sin_a, k0, k1, local)
@@ -613,6 +619,9 @@ class ChainagePoint:
 # returning the chronologically-earlier interpretation keeps the geometry
 # coherent and matches surveyor convention).
 # ---------------------------------------------------------------------------
+_EQUATION_CACHE_ATTR = "_align2qgis_equation_segments_cache"
+
+
 def _equation_segments(
     alignment: Alignment,
 ) -> list[tuple[float, float, float]]:
@@ -620,19 +629,29 @@ def _equation_segments(
 
     Each segment is a maximal interval of internal stations sharing the
     same constant display offset. With no equations the result is a single
-    span ``(-∞, +∞)`` at offset 0.
+    span ``(-∞, +∞)`` at offset 0. Result is cached on the alignment via a
+    private attribute so the hot chainage / projection paths don't re-sort
+    on every call.
     """
+    cached = getattr(alignment, _EQUATION_CACHE_ATTR, None)
+    if cached is not None and cached[0] is alignment.equations:
+        return cached[1]
     eqs = sorted(alignment.equations, key=lambda e: e.sta_internal)
     if not eqs:
-        return [(-math.inf, math.inf, 0.0)]
-    segs: list[tuple[float, float, float]] = []
-    prev = -math.inf
-    offset = 0.0
-    for eq in eqs:
-        segs.append((prev, eq.sta_internal, offset))
-        offset += eq.sta_ahead - eq.sta_internal
-        prev = eq.sta_internal
-    segs.append((prev, math.inf, offset))
+        segs: list[tuple[float, float, float]] = [(-math.inf, math.inf, 0.0)]
+    else:
+        segs = []
+        prev = -math.inf
+        offset = 0.0
+        for eq in eqs:
+            segs.append((prev, eq.sta_internal, offset))
+            offset += eq.sta_ahead - eq.sta_internal
+            prev = eq.sta_internal
+        segs.append((prev, math.inf, offset))
+    try:
+        object.__setattr__(alignment, _EQUATION_CACHE_ATTR, (alignment.equations, segs))
+    except (AttributeError, TypeError):
+        pass
     return segs
 
 
@@ -668,21 +687,36 @@ def display_to_internal(
     return None
 
 
+def _walker_at(
+    walkers: list[tuple], cum: list[float], s: float,
+) -> tuple[tuple, float]:
+    """Return ``(walker, local_s)`` for the walker that contains arclength ``s``.
+
+    Wraps the cumulative-length lookup and the per-walker offset
+    subtraction shared by :func:`alignment_xy_at_station`,
+    :func:`alignment_pose_at_station`, and :func:`alignment_chainage`'s
+    sample closure. ``local_s`` is clamped at zero so values that fall
+    on the segment boundary evaluate at the start of the next walker
+    rather than past the end of the previous one.
+    """
+    i = _locate_walker(cum, s)
+    local_s = max(0.0, s - (cum[i - 1] if i > 0 else 0.0))
+    return walkers[i], local_s
+
+
 def _locate_walker(cum: list[float], s: float) -> int:
     """Return the walker index whose arclength span contains ``s``.
 
     ``cum`` is the strictly increasing list of cumulative end-stations
-    ``[len_0, len_0+len_1, …]``. We pick ``bisect_right(cum, s) - 1`` so
+    ``[len_0, len_0+len_1, …]``. We pick ``bisect_left(cum, s)`` so
     boundary stations land on the walker whose cumulative-end equals ``s``
     (matching the original linear-scan semantics: "first walker whose
-    cum end ≥ s, then evaluate at local end"). The result is clamped to
-    ``[0, len(cum) - 1]``.
+    cum end ≥ s, then evaluate at local end"). The result is clamped at
+    the upper end; ``bisect_left`` already returns ``≥ 0``.
     """
     idx = bisect.bisect_left(cum, s)
     if idx >= len(cum):
         return len(cum) - 1
-    if idx < 0:
-        return 0
     return idx
 
 
@@ -772,9 +806,8 @@ def alignment_xy_at_station(
         length, pose_fn, *_ = walkers[-1]
         x, y, _ = pose_fn(length)
         return (x, y)
-    i = _locate_walker(cum, s)
-    length, pose_fn, *_ = walkers[i]
-    local_s = max(0.0, s - (cum[i - 1] if i > 0 else 0.0))
+    walker, local_s = _walker_at(walkers, cum, s)
+    _, pose_fn, *_ = walker
     x, y, _ = pose_fn(local_s)
     return (x, y)
 
@@ -802,6 +835,17 @@ class ProjectionResult:
     foot_y: float
 
 
+def _signed_left_offset(
+    px: float, py: float, fx: float, fy: float, tx: float, ty: float,
+) -> float:
+    """Signed distance from ``(fx, fy)`` to ``(px, py)`` along the left-perpendicular of ``(tx, ty)``.
+
+    ``(tx, ty)`` is the forward unit tangent at the foot; the left-perp is
+    ``(-ty, tx)``. Positive = left of the chainage-increasing direction.
+    """
+    return (px - fx) * (-ty) + (py - fy) * tx
+
+
 def _project_to_line_piece(
     piece: LinePiece, px: float, py: float,
 ) -> tuple[float, float, float, float, float]:
@@ -817,7 +861,7 @@ def _project_to_line_piece(
     s_clamped = max(0.0, min(L, s))
     fx = sx + s_clamped * tx
     fy = sy + s_clamped * ty
-    offset_signed = (px - fx) * (-ty) + (py - fy) * tx
+    offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
     return (s_clamped, offset_signed, fx, fy, residual)
 
@@ -855,7 +899,7 @@ def _project_to_curve_seg(
         tx, ty = -rad_y, rad_x
     else:
         tx, ty = rad_y, -rad_x
-    offset_signed = (px - fx) * (-ty) + (py - fy) * tx
+    offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
     return (s_local, offset_signed, fx, fy, residual)
 
@@ -910,7 +954,7 @@ def _project_to_spiral_seg(
     fx, fy, bearing_deg = _spiral_pose(seg, setup, s_opt)
     bearing = math.radians(bearing_deg)
     tx, ty = math.cos(bearing), math.sin(bearing)
-    offset_signed = (px - fx) * (-ty) + (py - fy) * tx
+    offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
     return (s_opt, offset_signed, fx, fy, residual)
 
@@ -987,9 +1031,8 @@ def alignment_pose_at_station(
     if s >= total:
         length, pose_fn, *_ = walkers[-1]
         return pose_fn(length)
-    i = _locate_walker(cum_arr, s)
-    length, pose_fn, *_ = walkers[i]
-    local_s = max(0.0, s - (cum_arr[i - 1] if i > 0 else 0.0))
+    walker, local_s = _walker_at(walkers, cum_arr, s)
+    _, pose_fn, *_ = walker
     return pose_fn(local_s)
 
 
@@ -1031,9 +1074,8 @@ def alignment_chainage(
             x, y, bearing = pose_fn(length)
             k = k1
         else:
-            i = _locate_walker(cum, s)
-            length, pose_fn, kind, ttype, k0, k1, desc, idx = walkers[i]
-            local_s = max(0.0, s - (cum[i - 1] if i > 0 else 0.0))
+            walker, local_s = _walker_at(walkers, cum, s)
+            length, pose_fn, kind, ttype, k0, k1, desc, idx = walker
             x, y, bearing = pose_fn(local_s)
             t = local_s / length if length > 0 else 0.0
             k = k0 + (k1 - k0) * t

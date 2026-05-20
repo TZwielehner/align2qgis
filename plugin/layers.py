@@ -294,37 +294,28 @@ def build_segment_layer(
     features: list[QgsFeature] = []
     for alignment in alignments:
         sta = alignment.sta_start or 0.0
+        # Bucket the alignment-wide 3D pieces back to their source segments
+        # so each segment feature gets its own contiguous slice; reuses the
+        # canonical station math in :func:`alignment_curve_pieces_3d`
+        # rather than re-deriving it inline.
+        pieces_with_z_by_seg: dict[int, list[tuple[object, list[float]]]] = {}
         if is_3d:
-            pieces_with_z_by_seg: dict[int, list[tuple[object, list[float]]]] = {}
-            cum = sta
-            for idx_a, seg_a in enumerate(alignment.segments):
-                L = segment_length(seg_a)
-                if L <= 0:
-                    continue
-                segp = segment_curve_pieces(seg_a)
-                if isinstance(seg_a, SpiralSeg):
-                    n = len(segp) or 1
-                    h = L / n
-                    pwz = []
-                    for i, piece in enumerate(segp):
-                        s0 = cum + i * h
-                        stations = (
-                            [s0, s0 + h / 2.0, s0 + h]
-                            if isinstance(piece, ArcPiece)
-                            else [s0, s0 + h]
-                        )
-                        pwz.append((piece, [_elev_at_internal(alignment, s) for s in stations]))
-                else:
-                    pwz = []
-                    for piece in segp:
-                        stations = (
-                            [cum, cum + L / 2.0, cum + L]
-                            if isinstance(piece, ArcPiece)
-                            else [cum, cum + L]
-                        )
-                        pwz.append((piece, [_elev_at_internal(alignment, s) for s in stations]))
-                pieces_with_z_by_seg[idx_a] = pwz
-                cum += L
+            all_pieces = alignment_curve_pieces_3d(alignment)
+            seg_arclengths = [segment_length(s) for s in alignment.segments]
+            seg_ends = []
+            acc = sta
+            for L in seg_arclengths:
+                acc += L
+                seg_ends.append(acc)
+            seg_idx = 0
+            for piece, stations in all_pieces:
+                # Advance to the segment whose end station covers this piece's end.
+                piece_end = stations[-1]
+                while seg_idx < len(seg_ends) - 1 and piece_end > seg_ends[seg_idx] + 1e-6:
+                    seg_idx += 1
+                pieces_with_z_by_seg.setdefault(seg_idx, []).append(
+                    (piece, [_elev_at_internal(alignment, s) for s in stations])
+                )
         for idx, seg in enumerate(alignment.segments):
             length = segment_length(seg)
             if length <= 0:

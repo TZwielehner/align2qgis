@@ -10,6 +10,7 @@ on file changes.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from ..constants import PROP_SOURCE_PATH
@@ -19,7 +20,8 @@ if TYPE_CHECKING:
     from qgis.core import QgsVectorLayer
 
 
-_CACHE: dict[tuple[str, float], list[Alignment]] = {}
+_CACHE: "OrderedDict[tuple[str, float], list[Alignment]]" = OrderedDict()
+_CACHE_MAX_ENTRIES = 16
 
 
 def alignments_for_layer(layer: "QgsVectorLayer") -> list[Alignment]:
@@ -27,12 +29,12 @@ def alignments_for_layer(layer: "QgsVectorLayer") -> list[Alignment]:
 
     Returns ``[]`` when the layer has no ``align2qgis/source_path`` custom
     property (e.g. a hand-drawn layer the user picked by mistake) or when
-    the file is no longer readable.
+    the file is no longer readable. ``getmtime`` doubles as the existence
+    probe — the ``OSError`` catch covers both "missing" and "not readable"
+    without a TOCTOU race against a separate ``os.path.exists``.
     """
     path = layer.customProperty(PROP_SOURCE_PATH)
     if not path or not isinstance(path, str):
-        return []
-    if not os.path.exists(path):
         return []
     try:
         mtime = os.path.getmtime(path)
@@ -41,6 +43,7 @@ def alignments_for_layer(layer: "QgsVectorLayer") -> list[Alignment]:
     key = (path, mtime)
     cached = _CACHE.get(key)
     if cached is not None:
+        _CACHE.move_to_end(key)
         return cached
     try:
         with open(path, "rb") as fh:
@@ -48,6 +51,8 @@ def alignments_for_layer(layer: "QgsVectorLayer") -> list[Alignment]:
     except (OSError, ValueError):
         return []
     _CACHE[key] = alignments
+    while len(_CACHE) > _CACHE_MAX_ENTRIES:
+        _CACHE.popitem(last=False)
     return alignments
 
 
