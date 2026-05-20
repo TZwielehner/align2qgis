@@ -122,6 +122,14 @@ class Align2QgisPlugin:
 
         self.iface.currentLayerChanged.connect(self._on_active_layer_changed)
 
+        # Keep the dock combo in sync with the project even when the dock is
+        # hidden — otherwise opening a saved project (or restoring a workspace
+        # where the dock was visible before layers loaded) leaves the combo
+        # empty until the next import.
+        project = QgsProject.instance()
+        project.layersAdded.connect(self._on_project_layers_changed)
+        project.layersRemoved.connect(self._on_project_layers_changed)
+
         # Processing provider — registers Station-from-point and the inverse
         # in the Processing Toolbox under an "Align2QGIS" group.
         self.provider = Align2QgisProvider()
@@ -132,6 +140,12 @@ class Align2QgisPlugin:
             self.iface.currentLayerChanged.disconnect(self._on_active_layer_changed)
         except (TypeError, RuntimeError):
             pass
+        project = QgsProject.instance()
+        for signal in (project.layersAdded, project.layersRemoved):
+            try:
+                signal.disconnect(self._on_project_layers_changed)
+            except (TypeError, RuntimeError):
+                pass
         self._disconnect_station_layer()
         if self.provider is not None:
             QgsApplication.processingRegistry().removeProvider(self.provider)
@@ -182,9 +196,19 @@ class Align2QgisPlugin:
             self._refresh_profile_for_active_layer()
 
     def _on_active_layer_changed(self, layer) -> None:
-        if self.profile_dock is None or not self.profile_dock.isVisible():
+        if self.profile_dock is None:
             return
-        self._refresh_profile_for_active_layer()
+        if self.profile_dock.isVisible():
+            self._refresh_profile_for_active_layer()
+        else:
+            # Keep the combo current so it's already populated the next time
+            # the user shows the dock.
+            self._refresh_dock_combo()
+
+    def _on_project_layers_changed(self, *_args) -> None:
+        if self.profile_dock is None:
+            return
+        self._refresh_dock_combo()
 
     def _refresh_profile_for_active_layer(self) -> None:
         if self.profile_dock is None:
