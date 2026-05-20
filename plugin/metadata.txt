@@ -4,7 +4,7 @@ qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Import LandXML horizontal alignments (lines, arcs, clothoid spirals) as QGIS line geometry.
 about=Reads LandXML Alignment/CoordGeom elements and produces a memory line layer with one feature per alignment. Spirals are discretized via Fresnel integration; arcs use exact circular arc math; lines are straight segments. Coordinate order follows the LandXML standard (Northing Easting); the plugin emits QGIS (X=Easting, Y=Northing).
-version=0.1.0
+version=0.2.0
 author=Thomas Zwielehner
 email=info@enjade.io
 tracker=https://github.com/TZwielehner/align2qgis/issues
