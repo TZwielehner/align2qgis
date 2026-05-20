@@ -33,7 +33,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsVectorLayer
 
-from .alignment_cache import alignments_for_layer
+from .alignment_cache import alignments_by_name
 from .landxml_parser import (
     PVI,
     ProfAlign,
@@ -43,12 +43,27 @@ from .landxml_parser import (
     profile_samples,
 )
 
+
+def _is_real_vertcurve(item) -> bool:
+    """A non-degenerate ``<VertCurve>`` item (PVIs and zero-length VCs return False)."""
+    return isinstance(item, VertCurve) and item.length > 0
+
 _SLIDER_STEPS = 100000  # int range; sub-decimetre resolution on a 10 km alignment
 
 # Vertical-exaggeration choices the user can pick from the toolbar.
 # 1× = autoscale-default. Higher values zoom into the elevation axis
 # (y-range divided by the factor, centered on the data midpoint).
 _VE_CHOICES = (1.0, 2.0, 5.0, 10.0, 25.0, 50.0)
+
+# Colour palette for the elevation-plot annotations. PVI/profile green
+# matches the densified profile line; crest/sag colours follow the rail
+# convention (warm = crest, cool = sag); equation marks read as
+# neutral guide lines.
+_COLOR_PROFILE = "#2a7a4a"
+_COLOR_CREST = "#b06b00"
+_COLOR_SAG = "#0066a6"
+_COLOR_NEUTRAL = "#666"
+_COLOR_GUIDE = "#888"
 
 try:
     from matplotlib.figure import Figure
@@ -243,12 +258,14 @@ class Align2QgisProfileDock(QDockWidget):
     ) -> None:
         """Populate from the canonical ``Segments`` and ``VerticalProfile`` layers.
 
-        Both layers are filtered to ``alignment_name``. The PVI rows from
-        ``vert_profile_layer`` are reconstructed into a ``Profile`` object and
-        passed through ``profile_samples`` so the plot is faithful to the
-        parabolic vertical-curve math. Station equations are resolved by
-        re-parsing the source LandXML behind ``segments_layer`` (via
-        :func:`alignments_for_layer`).
+        The Segments layer is filtered to ``alignment_name`` for the
+        curvature plot. PVI items and ``<StaEquation>`` discontinuities
+        come from the parsed :class:`Alignment` behind the Segments
+        layer (resolved via :func:`alignments_by_name`); the
+        ``vert_profile_layer`` is consulted only as a fallback when the
+        source LandXML can't be reached. The resulting items are
+        densified via :func:`profile_samples` so the elevation plot is
+        faithful to the parabolic vertical-curve math.
         """
         self._segments = []
         self._title = alignment_name
@@ -271,13 +288,21 @@ class Align2QgisProfileDock(QDockWidget):
             self._segments.sort(key=lambda s: s.sta_start)
         self._seg_starts = [s.sta_start for s in self._segments]
 
-        self._pvi_items = self._extract_pvi_items(vert_profile_layer, alignment_name)
+        # Prefer the parsed Alignment object — it carries the raw
+        # PVI/VertCurve items and StaEquation list directly, avoiding a
+        # round-trip through the rendered vertical-profile layer.
+        alignment_obj = self._resolve_alignment(segments_layer, alignment_name)
+        if alignment_obj is not None:
+            self._equations = list(alignment_obj.equations)
+            self._pvi_items = self._pvi_items_from_alignment(alignment_obj)
+        else:
+            self._equations = []
+            self._pvi_items = self._extract_pvi_items(vert_profile_layer, alignment_name)
         pairs = profile_samples(
             Profile(name="", alignments=[ProfAlign(name="", elements=list(self._pvi_items))])
         ) if self._pvi_items else []
         self._vert_stations = [s for s, _ in pairs]
         self._vert_elevs = [e for _, e in pairs]
-        self._equations = self._resolve_equations(segments_layer, alignment_name)
 
         self._station_range_cached = self._compute_station_range()
         self._highlight_sta = None
@@ -312,16 +337,25 @@ class Align2QgisProfileDock(QDockWidget):
         return items
 
     @staticmethod
-    def _resolve_equations(
+    def _resolve_alignment(
         segments_layer: QgsVectorLayer | None, alignment_name: str,
-    ) -> list[StaEquation]:
-        """Return ``alignment_name``'s ``<StaEquation>`` list, or ``[]``."""
+    ):
+        """Return the parsed :class:`Alignment` for ``alignment_name``, or ``None``."""
         if segments_layer is None or not segments_layer.isValid() or not alignment_name:
+            return None
+        return alignments_by_name(segments_layer).get(alignment_name)
+
+    @staticmethod
+    def _pvi_items_from_alignment(alignment) -> list[PVI | VertCurve]:
+        """Flatten every ``<ProfAlign>``'s elements into one station-sorted list."""
+        profile = getattr(alignment, "profile", None)
+        if profile is None:
             return []
-        for alignment in alignments_for_layer(segments_layer):
-            if alignment.name == alignment_name:
-                return list(alignment.equations)
-        return []
+        items: list[PVI | VertCurve] = []
+        for prof_align in profile.alignments:
+            items.extend(prof_align.elements)
+        items.sort(key=lambda x: x.station)
+        return items
 
     def set_highlight_station(self, station_m: float | None) -> None:
         self._highlight_sta = station_m
@@ -608,7 +642,7 @@ class Align2QgisProfileDock(QDockWidget):
         ax.plot(
             self._vert_stations,
             self._vert_elevs,
-            color="#2a7a4a",
+            color=_COLOR_PROFILE,
             linewidth=1.6,
         )
         ax.set_ylabel("Elevation (m)")
@@ -618,24 +652,30 @@ class Align2QgisProfileDock(QDockWidget):
         self._draw_equation_marks(ax)
 
     def _draw_pvi_annotations(self, ax) -> None:
-        """PVI dots + (sta, elev) labels, grade % on tangents, VC L/R, crests/sags."""
+        """Static annotations on the elevation plot.
+
+        Adds four layers, each tied to one pass over ``_pvi_items``:
+        PVI dots labelled with (station, elev), grade-percent labels
+        centred on each tangent run, ``L = / R =`` callouts under every
+        VertCurve PVI, and crest / sag diamonds at the parabola extremum
+        when it falls strictly inside the curve. The PVI dot sits at the
+        LandXML vertex elevation, not on the parabola — the offset is
+        useful for surveyors comparing the design vertex to the smoothed
+        through-curve elevation.
+        """
         items = self._pvi_items
         if not items:
             return
-        # 1) PVI dots + labels at the LandXML elev (the parabola passes
-        # below for a crest, above for a sag; the PVI is the theoretical
-        # vertex, useful for surveyors).
         for it in items:
-            ax.plot(it.station, it.elev, "o", markersize=4, color="#2a7a4a",
+            ax.plot(it.station, it.elev, "o", markersize=4, color=_COLOR_PROFILE,
                     markeredgecolor="white", markeredgewidth=0.6, zorder=4)
             ax.annotate(
                 f"{it.station:,.0f}\n{it.elev:.2f}",
                 xy=(it.station, it.elev),
                 xytext=(0, 8), textcoords="offset points",
-                ha="center", va="bottom", fontsize=7, color="#2a7a4a",
+                ha="center", va="bottom", fontsize=7, color=_COLOR_PROFILE,
                 zorder=4,
             )
-        # 2) Grade labels — centred on each tangent run between consecutive items.
         for a, b in zip(items, items[1:]):
             dx = b.station - a.station
             if dx <= 0:
@@ -652,9 +692,8 @@ class Align2QgisProfileDock(QDockWidget):
                           edgecolor="none", alpha=0.7),
                 zorder=3,
             )
-        # 3) VertCurve L / R callouts beneath each curve's PVI.
         for it in items:
-            if not isinstance(it, VertCurve) or it.length <= 0:
+            if not _is_real_vertcurve(it):
                 continue
             label = f"L = {it.length:g} m"
             if it.radius is not None and it.radius > 0:
@@ -663,12 +702,11 @@ class Align2QgisProfileDock(QDockWidget):
                 label,
                 xy=(it.station, it.elev),
                 xytext=(0, -22), textcoords="offset points",
-                ha="center", va="top", fontsize=7, color="#666",
+                ha="center", va="top", fontsize=7, color=_COLOR_NEUTRAL,
                 zorder=3,
             )
-        # 4) Crest / sag markers inside each VertCurve.
         for i, it in enumerate(items):
-            if not isinstance(it, VertCurve) or it.length <= 0:
+            if not _is_real_vertcurve(it):
                 continue
             if i == 0 or i == len(items) - 1:
                 continue
@@ -676,15 +714,14 @@ class Align2QgisProfileDock(QDockWidget):
             if extreme is None:
                 continue
             sta, elev, is_crest = extreme
-            ax.plot(sta, elev, marker="D", markersize=5,
-                    color="#b06b00" if is_crest else "#0066a6",
+            color = _COLOR_CREST if is_crest else _COLOR_SAG
+            ax.plot(sta, elev, marker="D", markersize=5, color=color,
                     markeredgecolor="white", markeredgewidth=0.6, zorder=5)
             ax.annotate(
                 f"{'crest' if is_crest else 'sag'}\n{sta:,.0f} / {elev:.2f}",
                 xy=(sta, elev),
                 xytext=(6, 0), textcoords="offset points",
-                ha="left", va="center", fontsize=7,
-                color="#b06b00" if is_crest else "#0066a6",
+                ha="left", va="center", fontsize=7, color=color,
                 zorder=5,
             )
 
@@ -693,13 +730,13 @@ class Align2QgisProfileDock(QDockWidget):
         if not self._equations:
             return
         for eq in self._equations:
-            ax.axvline(eq.sta_back, color="#888", linestyle="--",
+            ax.axvline(eq.sta_back, color=_COLOR_GUIDE, linestyle="--",
                        linewidth=0.8, alpha=0.7, zorder=2)
             ax.annotate(
                 f"{eq.sta_back:,.0f} → {eq.sta_ahead:,.0f}",
                 xy=(eq.sta_back, 1.0), xycoords=("data", "axes fraction"),
                 xytext=(2, -2), textcoords="offset points",
-                ha="left", va="top", fontsize=7, color="#666",
+                ha="left", va="top", fontsize=7, color=_COLOR_NEUTRAL,
                 rotation=90, zorder=2,
             )
 
