@@ -442,8 +442,11 @@ def build_stations_layer(
             feat.setAttribute(
                 "rotation", upright_bearing(-(cp.bearing_deg + label_offset))
             )
+            # Marker rotation in QGIS is CW from "up" (north); a Line marker
+            # at rotation=-bearing already draws perpendicular to a math-CCW
+            # tangent. The earlier "+90" double-rotated and produced a tangent.
             feat.setAttribute(
-                "rotation_perp", upright_bearing(-(cp.bearing_deg + 90.0))
+                "rotation_perp", upright_bearing(-cp.bearing_deg)
             )
             feat.setAttribute("seg_index", cp.seg_index)
             feat.setAttribute("seg_kind", cp.seg_kind)
@@ -497,8 +500,11 @@ def build_chainage_label_layer(
             feat.setAttribute(
                 "rotation", upright_bearing(-(cp.bearing_deg + label_offset))
             )
+            # Marker rotation in QGIS is CW from "up" (north); a Line marker
+            # at rotation=-bearing already draws perpendicular to a math-CCW
+            # tangent. The earlier "+90" double-rotated and produced a tangent.
             feat.setAttribute(
-                "rotation_perp", upright_bearing(-(cp.bearing_deg + 90.0))
+                "rotation_perp", upright_bearing(-cp.bearing_deg)
             )
             feat.setAttribute("seg_index", cp.seg_index)
             feat.setAttribute("seg_kind", cp.seg_kind)
