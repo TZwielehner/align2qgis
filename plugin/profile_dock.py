@@ -10,6 +10,11 @@ Slider scrubbing is the hot path. To stay smooth at 100 000 steps we only
 re-plot the static layers (segment colours, profile line, axes) when
 ``set_alignment`` / ``clear`` is called; on every slider tick we update
 just the cached red ``axvline`` handles and the text panel.
+
+Annotations on the elevation plot — PVI markers, grade labels on
+tangents, VertCurve length/radius callouts, crest/sag markers, and
+station-equation discontinuities — are part of the static layer and are
+preserved through the canvas's pan / zoom / vertical-exaggeration UI.
 """
 from __future__ import annotations
 
@@ -28,22 +33,57 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsVectorLayer
 
-from .landxml_parser import PVI, VertCurve, ProfAlign, Profile, profile_samples
+from .alignment_cache import alignments_by_name
+from .landxml_parser import (
+    PVI,
+    ProfAlign,
+    Profile,
+    StaEquation,
+    VertCurve,
+    profile_samples,
+)
+
+
+def _is_real_vertcurve(item) -> bool:
+    """A non-degenerate ``<VertCurve>`` item (PVIs and zero-length VCs return False)."""
+    return isinstance(item, VertCurve) and item.length > 0
 
 _SLIDER_STEPS = 100000  # int range; sub-decimetre resolution on a 10 km alignment
 
+# Vertical-exaggeration choices the user can pick from the toolbar.
+# 1× = autoscale-default. Higher values zoom into the elevation axis
+# (y-range divided by the factor, centered on the data midpoint).
+_VE_CHOICES = (1.0, 2.0, 5.0, 10.0, 25.0, 50.0)
+
+# Colour palette for the elevation-plot annotations. PVI/profile green
+# matches the densified profile line; crest/sag colours follow the rail
+# convention (warm = crest, cool = sag); equation marks read as
+# neutral guide lines.
+_COLOR_PROFILE = "#2a7a4a"
+_COLOR_CREST = "#b06b00"
+_COLOR_SAG = "#0066a6"
+_COLOR_NEUTRAL = "#666"
+_COLOR_GUIDE = "#888"
+
 try:
     from matplotlib.figure import Figure
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _Canvas
+    from matplotlib.backends.backend_qtagg import (
+        FigureCanvasQTAgg as _Canvas,
+        NavigationToolbar2QT as _Toolbar,
+    )
     _HAS_MPL = True
 except ImportError:
     try:
         from matplotlib.figure import Figure  # type: ignore[no-redef]
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _Canvas
+        from matplotlib.backends.backend_qt5agg import (  # type: ignore[no-redef]
+            FigureCanvasQTAgg as _Canvas,
+            NavigationToolbar2QT as _Toolbar,
+        )
         _HAS_MPL = True
     except ImportError:
         Figure = None  # type: ignore[assignment]
         _Canvas = None  # type: ignore[assignment]
+        _Toolbar = None  # type: ignore[assignment]
         _HAS_MPL = False
 
 
@@ -82,6 +122,37 @@ def _optional_float(value) -> float | None:
         return None
 
 
+def _high_low_point(
+    prev_pvi, vc: VertCurve, next_pvi,
+) -> tuple[float, float, bool] | None:
+    """Crest / sag inside a VertCurve, or ``None`` when the extreme is outside.
+
+    The parabola is ``y(s) = y_bvc + g_back·s + (g_ahead − g_back)/(2L)·s²``;
+    its slope vanishes at ``s* = −g_back · L / (g_ahead − g_back)``. Returns
+    ``(station, elevation, is_crest)`` when ``0 < s* < L``.
+    """
+    L = vc.length
+    if L <= 0:
+        return None
+    dx_back = vc.station - prev_pvi.station
+    dx_ahead = next_pvi.station - vc.station
+    if dx_back <= 0 or dx_ahead <= 0:
+        return None
+    g_back = (vc.elev - prev_pvi.elev) / dx_back
+    g_ahead = (next_pvi.elev - vc.elev) / dx_ahead
+    dg = g_ahead - g_back
+    if abs(dg) < 1e-9:
+        return None
+    s_star = -g_back * L / dg
+    if s_star <= 0 or s_star >= L:
+        return None
+    sta_bvc = vc.station - L / 2.0
+    elev_bvc = vc.elev - (L / 2.0) * g_back
+    sta = sta_bvc + s_star
+    elev = elev_bvc + g_back * s_star + dg / (2.0 * L) * s_star * s_star
+    return sta, elev, dg < 0
+
+
 class Align2QgisProfileDock(QDockWidget):
     """Floating/dock widget showing curvature + vertical profile of an alignment."""
 
@@ -93,9 +164,18 @@ class Align2QgisProfileDock(QDockWidget):
         self._seg_starts: list[float] = []
         self._vert_stations: list[float] = []
         self._vert_elevs: list[float] = []
+        # Raw PVI / VertCurve items (in display-station space) for the
+        # elevation-plot annotations. Distinct from the densified
+        # (station, elev) pairs above, which the slider tooltip uses.
+        self._pvi_items: list[PVI | VertCurve] = []
+        self._equations: list[StaEquation] = []
         self._station_range_cached: tuple[float, float] | None = None
         self._highlight_sta: float | None = None
         self._title: str = ""
+        self._vert_exaggeration: float = 1.0
+        # Y-axis limits captured on first draw so VE adjustments stay
+        # anchored to the data extent, not the previous zoom level.
+        self._vert_baseline_ylim: tuple[float, float] | None = None
         # Cached matplotlib artist handles. We mutate their data on slider
         # scrub instead of re-plotting the segment lines.
         self._curv_vline = None
@@ -118,13 +198,19 @@ class Align2QgisProfileDock(QDockWidget):
         if _HAS_MPL:
             self.figure = Figure(figsize=(5, 4.4), tight_layout=True)
             self.canvas = _Canvas(self.figure)
+            self.toolbar = _Toolbar(self.canvas, container)
+            self.toolbar.setIconSize(self.toolbar.iconSize() * 0.85)
+            layout.addWidget(self.toolbar)
             self.ax_curv, self.ax_vert = self.figure.subplots(
                 2, 1, sharex=True, gridspec_kw={"height_ratios": [1, 1]}
             )
             layout.addWidget(self.canvas)
+            # Mouse-wheel zoom in either subplot, anchored at the cursor.
+            self.canvas.mpl_connect("scroll_event", self._on_scroll)
         else:
             self.figure = None
             self.canvas = None
+            self.toolbar = None
             self.ax_curv = None
             self.ax_vert = None
             layout.addWidget(
@@ -134,17 +220,25 @@ class Align2QgisProfileDock(QDockWidget):
                 )
             )
 
-        slider_row = QHBoxLayout()
+        controls_row = QHBoxLayout()
+        controls_row.addWidget(QLabel("V exag:"))
+        self.ve_combo = QComboBox()
+        for ve in _VE_CHOICES:
+            self.ve_combo.addItem(f"{ve:g}×", ve)
+        self.ve_combo.setEnabled(_HAS_MPL)
+        self.ve_combo.currentIndexChanged.connect(self._on_ve_changed)
+        controls_row.addWidget(self.ve_combo)
+        controls_row.addSpacing(12)
         self.station_label = QLabel("Station: —")
         self.station_label.setMinimumWidth(140)
+        controls_row.addWidget(self.station_label)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, _SLIDER_STEPS)
         self.slider.setValue(0)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider_changed)
-        slider_row.addWidget(self.station_label)
-        slider_row.addWidget(self.slider, 1)
-        layout.addLayout(slider_row)
+        controls_row.addWidget(self.slider, 1)
+        layout.addLayout(controls_row)
 
         self.info_label = QLabel("Select an Align2QGIS alignment or station.")
         self.info_label.setWordWrap(True)
@@ -164,10 +258,14 @@ class Align2QgisProfileDock(QDockWidget):
     ) -> None:
         """Populate from the canonical ``Segments`` and ``VerticalProfile`` layers.
 
-        Both layers are filtered to ``alignment_name``. The PVI rows from
-        ``vert_profile_layer`` are reconstructed into a ``Profile`` object and
-        passed through ``profile_samples`` so the plot is faithful to the
-        parabolic vertical-curve math.
+        The Segments layer is filtered to ``alignment_name`` for the
+        curvature plot. PVI items and ``<StaEquation>`` discontinuities
+        come from the parsed :class:`Alignment` behind the Segments
+        layer (resolved via :func:`alignments_by_name`); the
+        ``vert_profile_layer`` is consulted only as a fallback when the
+        source LandXML can't be reached. The resulting items are
+        densified via :func:`profile_samples` so the elevation plot is
+        faithful to the parabolic vertical-curve math.
         """
         self._segments = []
         self._title = alignment_name
@@ -190,24 +288,37 @@ class Align2QgisProfileDock(QDockWidget):
             self._segments.sort(key=lambda s: s.sta_start)
         self._seg_starts = [s.sta_start for s in self._segments]
 
-        pairs = self._densify_vert_profile(vert_profile_layer, alignment_name)
+        # Prefer the parsed Alignment object — it carries the raw
+        # PVI/VertCurve items and StaEquation list directly, avoiding a
+        # round-trip through the rendered vertical-profile layer.
+        alignment_obj = self._resolve_alignment(segments_layer, alignment_name)
+        if alignment_obj is not None:
+            self._equations = list(alignment_obj.equations)
+            self._pvi_items = self._pvi_items_from_alignment(alignment_obj)
+        else:
+            self._equations = []
+            self._pvi_items = self._extract_pvi_items(vert_profile_layer, alignment_name)
+        pairs = profile_samples(
+            Profile(name="", alignments=[ProfAlign(name="", elements=list(self._pvi_items))])
+        ) if self._pvi_items else []
         self._vert_stations = [s for s, _ in pairs]
         self._vert_elevs = [e for _, e in pairs]
 
         self._station_range_cached = self._compute_station_range()
         self._highlight_sta = None
+        self._vert_baseline_ylim = None  # recompute on next draw for the new data
         self._sync_slider_range()
         self._redraw_static()
         self._update_highlight()
 
     @staticmethod
-    def _densify_vert_profile(
+    def _extract_pvi_items(
         layer: QgsVectorLayer | None, alignment_name: str,
-    ) -> list[tuple[float, float]]:
-        """Read PVI rows from ``layer``, reconstruct a Profile, call profile_samples."""
+    ) -> list[PVI | VertCurve]:
+        """Read PVI rows from the vertical-profile layer and rebuild the items list."""
         if layer is None or not layer.isValid():
             return []
-        items = []
+        items: list[PVI | VertCurve] = []
         for feat in layer.getFeatures():
             try:
                 if alignment_name and str(feat["alignment"]) != alignment_name:
@@ -222,10 +333,29 @@ class Align2QgisProfileDock(QDockWidget):
                 items.append(PVI(station=sta, elev=elev))
             else:
                 items.append(VertCurve(station=sta, elev=elev, length=vc_len))
-        if not items:
+        items.sort(key=lambda x: x.station)
+        return items
+
+    @staticmethod
+    def _resolve_alignment(
+        segments_layer: QgsVectorLayer | None, alignment_name: str,
+    ):
+        """Return the parsed :class:`Alignment` for ``alignment_name``, or ``None``."""
+        if segments_layer is None or not segments_layer.isValid() or not alignment_name:
+            return None
+        return alignments_by_name(segments_layer).get(alignment_name)
+
+    @staticmethod
+    def _pvi_items_from_alignment(alignment) -> list[PVI | VertCurve]:
+        """Flatten every ``<ProfAlign>``'s elements into one station-sorted list."""
+        profile = getattr(alignment, "profile", None)
+        if profile is None:
             return []
-        prof = Profile(name="", alignments=[ProfAlign(name="", elements=items)])
-        return profile_samples(prof)
+        items: list[PVI | VertCurve] = []
+        for prof_align in profile.alignments:
+            items.extend(prof_align.elements)
+        items.sort(key=lambda x: x.station)
+        return items
 
     def set_highlight_station(self, station_m: float | None) -> None:
         self._highlight_sta = station_m
@@ -238,9 +368,12 @@ class Align2QgisProfileDock(QDockWidget):
         self._seg_starts = []
         self._vert_stations = []
         self._vert_elevs = []
+        self._pvi_items = []
+        self._equations = []
         self._station_range_cached = None
         self._highlight_sta = None
         self._title = ""
+        self._vert_baseline_ylim = None
         self._sync_slider_range()
         self._redraw_static()
         self._update_highlight()
@@ -297,29 +430,32 @@ class Align2QgisProfileDock(QDockWidget):
         return (lo, hi) if hi > lo else None
 
     def _sync_slider_range(self) -> None:
-        rng = self._station_range_cached
-        self.slider.blockSignals(True)
-        self.slider.setEnabled(rng is not None)
-        self.slider.setValue(0)
-        self.slider.blockSignals(False)
+        sr = self._station_range_cached
+        if sr is None:
+            self.slider.setEnabled(False)
+            return
+        self.slider.setEnabled(True)
 
     def _set_slider_to_station(self, station: float) -> None:
-        rng = self._station_range_cached
-        if rng is None:
+        sr = self._station_range_cached
+        if sr is None:
             return
-        lo, hi = rng
-        val = int(round((station - lo) / (hi - lo) * _SLIDER_STEPS))
-        val = max(0, min(_SLIDER_STEPS, val))
+        lo, hi = sr
+        if hi <= lo:
+            return
+        t = (station - lo) / (hi - lo)
+        val = max(0, min(_SLIDER_STEPS, int(round(t * _SLIDER_STEPS))))
         self.slider.blockSignals(True)
         self.slider.setValue(val)
         self.slider.blockSignals(False)
 
     def _station_from_slider(self, val: int) -> float | None:
-        rng = self._station_range_cached
-        if rng is None:
+        sr = self._station_range_cached
+        if sr is None:
             return None
-        lo, hi = rng
-        return lo + (val / _SLIDER_STEPS) * (hi - lo)
+        lo, hi = sr
+        t = val / _SLIDER_STEPS
+        return lo + t * (hi - lo)
 
     def _on_slider_changed(self, val: int) -> None:
         sta = self._station_from_slider(val)
@@ -327,6 +463,56 @@ class Align2QgisProfileDock(QDockWidget):
             return
         self._highlight_sta = sta
         self._update_highlight()
+
+    # ------------------------------------------------------------------
+    # Vertical exaggeration / wheel zoom
+    # ------------------------------------------------------------------
+    def _on_ve_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        ve = self.ve_combo.itemData(index)
+        if ve is None:
+            return
+        self._vert_exaggeration = float(ve)
+        self._apply_vert_exaggeration()
+        if self.canvas is not None:
+            self.canvas.draw_idle()
+
+    def _apply_vert_exaggeration(self) -> None:
+        """Resize the elevation y-axis around its midpoint by ``1 / VE``.
+
+        "1×" here means the autoscale-default range fits the data with a
+        small margin; higher VE values zoom into the elevation axis so
+        small grade changes become visible on rail-style alignments where
+        the elevation variation is hundreds of times smaller than the
+        plan length.
+        """
+        if self.ax_vert is None or self._vert_baseline_ylim is None:
+            return
+        lo, hi = self._vert_baseline_ylim
+        mid = 0.5 * (lo + hi)
+        half = 0.5 * (hi - lo) / max(self._vert_exaggeration, 1e-6)
+        self.ax_vert.set_ylim(mid - half, mid + half)
+
+    def _on_scroll(self, event) -> None:
+        """Mouse-wheel zoom anchored at the cursor in whichever subplot is active."""
+        if event.inaxes is None or self.canvas is None:
+            return
+        ax = event.inaxes
+        scale = 1.0 / 1.2 if event.button == "up" else 1.2
+        xdata = event.xdata
+        ydata = event.ydata
+        if xdata is None or ydata is None:
+            return
+        xlo, xhi = ax.get_xlim()
+        ylo, yhi = ax.get_ylim()
+        new_x_range = (xhi - xlo) * scale
+        new_y_range = (yhi - ylo) * scale
+        relx = (xhi - xdata) / (xhi - xlo) if xhi > xlo else 0.5
+        rely = (yhi - ydata) / (yhi - ylo) if yhi > ylo else 0.5
+        ax.set_xlim(xdata - new_x_range * (1 - relx), xdata + new_x_range * relx)
+        ax.set_ylim(ydata - new_y_range * (1 - rely), ydata + new_y_range * rely)
+        self.canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Drawing — static (cold path) vs highlight (slider-scrub hot path)
@@ -347,6 +533,13 @@ class Align2QgisProfileDock(QDockWidget):
             self.figure.suptitle(self._title, fontsize=9)
         else:
             self.figure.suptitle("")
+        # Capture the autoscaled y-range so the VE control has a stable
+        # baseline that doesn't drift with manual zoom.
+        if self._vert_stations:
+            self._vert_baseline_ylim = self.ax_vert.get_ylim()
+            self._apply_vert_exaggeration()
+        else:
+            self._vert_baseline_ylim = None
         self.canvas.draw_idle()
 
     def _update_highlight(self) -> None:
@@ -433,19 +626,7 @@ class Align2QgisProfileDock(QDockWidget):
 
     def _draw_vertical(self, ax) -> None:
         ax.clear()
-        if self._vert_stations:
-            # Samples are densified inside vertical curves (parabolic
-            # evaluation in landxml_parser.profile_samples), so a plain
-            # line plot is faithful — no scatter dots needed.
-            ax.plot(
-                self._vert_stations,
-                self._vert_elevs,
-                color="#2a7a4a",
-                linewidth=1.6,
-            )
-            ax.set_ylabel("Elevation (m)")
-            ax.grid(True, alpha=0.25)
-        else:
+        if not self._vert_stations:
             ax.text(
                 0.5, 0.5, "No vertical profile in source LandXML",
                 transform=ax.transAxes, ha="center", va="center",
@@ -453,7 +634,111 @@ class Align2QgisProfileDock(QDockWidget):
             )
             ax.set_yticks([])
             ax.grid(False)
+            ax.set_xlabel("Station (m)")
+            return
+        # Samples are densified inside vertical curves (parabolic evaluation
+        # in landxml_parser.profile_samples), so a plain line plot is
+        # faithful — no scatter dots needed.
+        ax.plot(
+            self._vert_stations,
+            self._vert_elevs,
+            color=_COLOR_PROFILE,
+            linewidth=1.6,
+        )
+        ax.set_ylabel("Elevation (m)")
+        ax.grid(True, alpha=0.25)
         ax.set_xlabel("Station (m)")
+        self._draw_pvi_annotations(ax)
+        self._draw_equation_marks(ax)
+
+    def _draw_pvi_annotations(self, ax) -> None:
+        """Static annotations on the elevation plot.
+
+        Adds four layers, each tied to one pass over ``_pvi_items``:
+        PVI dots labelled with (station, elev), grade-percent labels
+        centred on each tangent run, ``L = / R =`` callouts under every
+        VertCurve PVI, and crest / sag diamonds at the parabola extremum
+        when it falls strictly inside the curve. The PVI dot sits at the
+        LandXML vertex elevation, not on the parabola — the offset is
+        useful for surveyors comparing the design vertex to the smoothed
+        through-curve elevation.
+        """
+        items = self._pvi_items
+        if not items:
+            return
+        for it in items:
+            ax.plot(it.station, it.elev, "o", markersize=4, color=_COLOR_PROFILE,
+                    markeredgecolor="white", markeredgewidth=0.6, zorder=4)
+            ax.annotate(
+                f"{it.station:,.0f}\n{it.elev:.2f}",
+                xy=(it.station, it.elev),
+                xytext=(0, 8), textcoords="offset points",
+                ha="center", va="bottom", fontsize=7, color=_COLOR_PROFILE,
+                zorder=4,
+            )
+        for a, b in zip(items, items[1:]):
+            dx = b.station - a.station
+            if dx <= 0:
+                continue
+            grade_pct = (b.elev - a.elev) / dx * 100.0
+            mid_sta = 0.5 * (a.station + b.station)
+            mid_elev = 0.5 * (a.elev + b.elev)
+            ax.annotate(
+                f"{grade_pct:+.2f} %",
+                xy=(mid_sta, mid_elev),
+                xytext=(0, -10), textcoords="offset points",
+                ha="center", va="top", fontsize=7, color="#444",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
+                          edgecolor="none", alpha=0.7),
+                zorder=3,
+            )
+        for it in items:
+            if not _is_real_vertcurve(it):
+                continue
+            label = f"L = {it.length:g} m"
+            if it.radius is not None and it.radius > 0:
+                label += f"\nR = {it.radius:g} m"
+            ax.annotate(
+                label,
+                xy=(it.station, it.elev),
+                xytext=(0, -22), textcoords="offset points",
+                ha="center", va="top", fontsize=7, color=_COLOR_NEUTRAL,
+                zorder=3,
+            )
+        for i, it in enumerate(items):
+            if not _is_real_vertcurve(it):
+                continue
+            if i == 0 or i == len(items) - 1:
+                continue
+            extreme = _high_low_point(items[i - 1], it, items[i + 1])
+            if extreme is None:
+                continue
+            sta, elev, is_crest = extreme
+            color = _COLOR_CREST if is_crest else _COLOR_SAG
+            ax.plot(sta, elev, marker="D", markersize=5, color=color,
+                    markeredgecolor="white", markeredgewidth=0.6, zorder=5)
+            ax.annotate(
+                f"{'crest' if is_crest else 'sag'}\n{sta:,.0f} / {elev:.2f}",
+                xy=(sta, elev),
+                xytext=(6, 0), textcoords="offset points",
+                ha="left", va="center", fontsize=7, color=color,
+                zorder=5,
+            )
+
+    def _draw_equation_marks(self, ax) -> None:
+        """Dashed vertical + top-axis label at each ``<StaEquation>`` point."""
+        if not self._equations:
+            return
+        for eq in self._equations:
+            ax.axvline(eq.sta_back, color=_COLOR_GUIDE, linestyle="--",
+                       linewidth=0.8, alpha=0.7, zorder=2)
+            ax.annotate(
+                f"{eq.sta_back:,.0f} → {eq.sta_ahead:,.0f}",
+                xy=(eq.sta_back, 1.0), xycoords=("data", "axes fraction"),
+                xytext=(2, -2), textcoords="offset points",
+                ha="left", va="top", fontsize=7, color=_COLOR_NEUTRAL,
+                rotation=90, zorder=2,
+            )
 
     # ------------------------------------------------------------------
     # Text panel + lookups
@@ -527,7 +812,7 @@ class Align2QgisProfileDock(QDockWidget):
             return None
         length = s.sta_end - s.sta_start
         if length <= 0:
-            return (s.kind, s.curvature_start)
+            return s.kind, s.curvature_start
         t = (station - s.sta_start) / length
-        k = s.curvature_start + t * (s.curvature_end - s.curvature_start)
-        return (s.kind, k)
+        k = s.curvature_start + (s.curvature_end - s.curvature_start) * t
+        return s.kind, k

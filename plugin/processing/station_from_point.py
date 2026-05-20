@@ -23,7 +23,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 
 from ..geometry_builder import alignment_project_point
-from ._alignment_cache import alignments_for_layer
+from ..alignment_cache import alignments_for_layer
 
 
 class StationFromPointAlgorithm(QgsProcessingAlgorithm):
