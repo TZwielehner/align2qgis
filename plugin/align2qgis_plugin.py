@@ -514,7 +514,7 @@ class Align2QgisPlugin:
                 perpendicular=opts.label_perpendicular,
             ))
             if chain_layer.featureCount() > 0:
-                out.append((chain_layer, CHAINAGE_LABEL_LAYER, _KIND_CHAINAGE, False))
+                out.append((chain_layer, CHAINAGE_LABEL_LAYER, _KIND_CHAINAGE, True))
 
         if opts.create_dimension_layer and (
             opts.dim_arcs or opts.dim_spirals or opts.dim_tangents
@@ -560,28 +560,43 @@ class Align2QgisPlugin:
             base = os.path.basename(opts.landxml_path)
             write_layers_to_gpkg(persisted, opts.gpkg_path, source_file=base)
 
-        for layer, name, kind, persist in new_layers:
-            existing = self._find_named_layer(project, name)
-            if existing is None:
-                if persist and opts.gpkg_path:
-                    gpkg_layer = QgsVectorLayer(
-                        f"{opts.gpkg_path}|layername={name}", name, "ogr"
-                    )
-                    if gpkg_layer.isValid():
-                        tag_layer(gpkg_layer, opts.landxml_path, opts.crs_authid)
-                        project.addMapLayer(gpkg_layer, False)
-                        group.addLayer(gpkg_layer)
-                        self._apply_styling(gpkg_layer, kind, opts)
-                        continue
-                project.addMapLayer(layer, False)
-                group.addLayer(layer)
-                self._apply_styling(layer, kind, opts)
-            else:
-                # Layer already exists in project — append the freshly-built
-                # features into it. Memory layers and GPKG-backed layers both
-                # support dataProvider().addFeatures().
-                self._append_features(existing, layer)
-                self._apply_styling(existing, kind, opts)
+        # Freeze the canvas while we add layers — adding a memory layer with
+        # data-defined symbology to the layer tree otherwise forces a full
+        # render per layer (~30 s on a long alignment's Chainage layer).
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        if canvas is not None:
+            canvas.freeze(True)
+        try:
+            for layer, name, kind, persist in new_layers:
+                existing = self._find_named_layer(project, name)
+                if existing is None:
+                    if persist and opts.gpkg_path:
+                        gpkg_layer = QgsVectorLayer(
+                            f"{opts.gpkg_path}|layername={name}", name, "ogr"
+                        )
+                        if gpkg_layer.isValid():
+                            tag_layer(gpkg_layer, opts.landxml_path, opts.crs_authid)
+                            project.addMapLayer(gpkg_layer, False)
+                            tree_node = group.addLayer(gpkg_layer)
+                            if kind == _KIND_CHAINAGE and tree_node is not None:
+                                tree_node.setItemVisibilityChecked(False)
+                            self._apply_styling(gpkg_layer, kind, opts)
+                            continue
+                    project.addMapLayer(layer, False)
+                    tree_node = group.addLayer(layer)
+                    if kind == _KIND_CHAINAGE and tree_node is not None:
+                        tree_node.setItemVisibilityChecked(False)
+                    self._apply_styling(layer, kind, opts)
+                else:
+                    # Layer already exists in project — append the freshly-built
+                    # features into it. Memory layers and GPKG-backed layers both
+                    # support dataProvider().addFeatures().
+                    self._append_features(existing, layer)
+                    self._apply_styling(existing, kind, opts)
+        finally:
+            if canvas is not None:
+                canvas.freeze(False)
+                canvas.refresh()
 
         return opts.gpkg_path or "in-memory layers"
 
