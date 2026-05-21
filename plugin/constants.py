@@ -22,6 +22,8 @@ STATIONS_LAYER_PREFIX = "Stations"
 DIMENSIONS_LAYER_PREFIX = "Dimensions"
 VERTICAL_PROFILE_LAYER = "VerticalProfile"
 CROSS_SECTIONS_LAYER = "CrossSections"
+CROSS_SECTION_SURFACES_LAYER = "CrossSectionSurfaces"
+CG_POINTS_LAYER = "CgPoints"
 
 # In-memory only — interval chainage labels along the Alignments layer.
 # Not persisted to the GeoPackage; rebuilt on every import.
@@ -30,3 +32,14 @@ CHAINAGE_LABEL_LAYER = "Chainage (interval)"
 # Column that distinguishes rows from different LandXML imports inside the
 # shared canonical tables. Re-import semantics delete-by-source then append.
 SOURCE_FILE_FIELD = "source_file"
+
+# Every canonical layer name the plugin emits — the CRS-conflict probe and
+# the per-import purge both iterate this. Single source of truth so they
+# can't drift when new entity layers are added. Defined last so every
+# referenced name is already bound at module load.
+CANONICAL_LAYERS: tuple[str, ...] = (
+    ALIGNMENT_LAYER_PREFIX, SEGMENTS_LAYER_PREFIX,
+    STATIONS_LAYER_PREFIX, DIMENSIONS_LAYER_PREFIX,
+    CHAINAGE_LABEL_LAYER, VERTICAL_PROFILE_LAYER, CROSS_SECTIONS_LAYER,
+    CROSS_SECTION_SURFACES_LAYER, CG_POINTS_LAYER,
+)

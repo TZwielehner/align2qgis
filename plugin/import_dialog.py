@@ -25,6 +25,8 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from .landxml_parser import peek_source_crs
+
 
 _PREFIX = "Align2QGIS/"
 
@@ -50,8 +52,10 @@ class Align2QgisImportDialog(QDialog):
         self.setMinimumWidth(480)
 
         settings = QSettings()
+        self._default_crs = default_crs
 
         self.path_edit = QLineEdit()
+        self.path_edit.editingFinished.connect(self._update_detected_hint)
         path_btn = QPushButton("Browse…")
         path_btn.clicked.connect(self._pick_landxml)
         path_row = QHBoxLayout()
@@ -59,6 +63,9 @@ class Align2QgisImportDialog(QDialog):
         path_row.addWidget(path_btn)
 
         self.crs_edit = QLineEdit(default_crs)
+        self.detected_crs_label = QLabel("")
+        self.detected_crs_label.setWordWrap(True)
+        self.detected_crs_label.setStyleSheet("color: #666;")
 
         self.interval_spin = QDoubleSpinBox()
         self.interval_spin.setRange(0.0, 10000.0)
@@ -119,6 +126,7 @@ class Align2QgisImportDialog(QDialog):
         form = QFormLayout()
         form.addRow("LandXML file", path_row)
         form.addRow("CRS (AuthID)", self.crs_edit)
+        form.addRow("", self.detected_crs_label)
         form.addRow("Chainage interval", self.interval_spin)
 
         buttons = QDialogButtonBox(
@@ -144,6 +152,43 @@ class Align2QgisImportDialog(QDialog):
         )
         if path:
             self.path_edit.setText(path)
+            detected = self._update_detected_hint()
+            # Only the explicit file-pick interaction auto-fills the CRS field,
+            # and only when the user hasn't already overridden it. Typed paths
+            # update the hint without surprising the user with a replaced CRS.
+            if detected and self.crs_edit.text().strip() == self._default_crs:
+                self.crs_edit.setText(detected)
+
+    def _update_detected_hint(self) -> str | None:
+        """Peek the LandXML's ``<CoordinateSystem>`` element and update the
+        hint label below the CRS field. Returns the detected CRS authid (or
+        ``None`` if nothing usable was found) so callers can decide whether to
+        also overwrite the CRS field.
+        """
+        path = self.path_edit.text().strip()
+        if not path:
+            self.detected_crs_label.setText("")
+            return None
+        try:
+            with open(path, "rb") as fh:
+                detected = peek_source_crs(fh.read())
+        except OSError:
+            self.detected_crs_label.setText("")
+            return None
+        if detected:
+            self.detected_crs_label.setText(
+                f"Detected source CRS in file: {detected}. "
+                f"The field above declares the CRS the file's coordinates "
+                f"are in; data is transformed into the GeoPackage's CRS if "
+                f"that differs. Override if the file is actually in another CRS."
+            )
+        else:
+            self.detected_crs_label.setText(
+                "No <CoordinateSystem epsgCode> in file — the field above "
+                "declares the CRS the coordinates are in. Transformed into "
+                "the GeoPackage's CRS on import if that differs."
+            )
+        return detected
 
     def _pick_gpkg(self) -> None:
         path, _ = QFileDialog.getSaveFileName(

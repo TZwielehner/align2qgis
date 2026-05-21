@@ -720,6 +720,9 @@ def _locate_walker(cum: list[float], s: float) -> int:
     return idx
 
 
+_WALKERS_CACHE_ATTR = "_align2qgis_walkers_cache"
+
+
 def _segment_walkers(alignment: Alignment) -> tuple[list[tuple], list[float]]:
     """Return ``(walkers, cum)`` where each walker is
     ``(length, pose_fn, kind, transition, k_start, k_end, desc, idx)`` and
@@ -732,7 +735,17 @@ def _segment_walkers(alignment: Alignment) -> tuple[list[tuple], list[float]]:
     precomputed once per segment. The cumulative-end array lets callers use
     :func:`_locate_walker` to find the containing walker in O(log N) instead
     of scanning every station linearly.
+
+    Result is cached on the alignment instance keyed off
+    ``alignment.segments`` identity — cross-section layer builders that call
+    per-station lookups hundreds of times stop paying the setup cost on each
+    call. Reprojection mutates segment fields in place, so the cache must
+    only be populated *after* any reprojection — every entry point that
+    touches geometry already runs reprojection first.
     """
+    cached = getattr(alignment, _WALKERS_CACHE_ATTR, None)
+    if cached is not None and cached[0] is alignment.segments:
+        return cached[1]
     walkers: list[tuple] = []
     cum: list[float] = []
     total = 0.0
@@ -775,41 +788,21 @@ def _segment_walkers(alignment: Alignment) -> tuple[list[tuple], list[float]]:
             ))
             total += length
             cum.append(total)
-    return walkers, cum
+    result = (walkers, cum)
+    object.__setattr__(alignment, _WALKERS_CACHE_ATTR, (alignment.segments, result))
+    return result
 
 
 def alignment_xy_at_station(
     alignment: Alignment, station: float,
 ) -> tuple[float, float] | None:
-    """Return plan-XY at ``station`` along ``alignment``, or None if out of range.
+    """Plan-XY at ``station``, or None if out of range. (x, y) only.
 
-    Walks the same segment pose functions ``alignment_chainage`` uses, but
-    returns just (x, y) for a single station — used by the PVI and
-    cross-section layer builders to place per-station point features.
+    Thin wrapper around :func:`alignment_pose_at_station` (defined below in
+    the projection section) for callers that don't need the tangent bearing.
     """
-    walkers, cum = _segment_walkers(alignment)
-    if not walkers:
-        return None
-    total = cum[-1]
-    if total <= 0:
-        return None
-    sta_start = alignment.sta_start or 0.0
-    # ``station`` is a displayed value — convert through the equation map
-    # to the alignment-internal arclength coordinate first.
-    internal = display_to_internal(alignment, station)
-    if internal is None:
-        return None
-    s = internal - sta_start
-    if s < -1e-6 or s > total + 1e-6:
-        return None
-    if s >= total:
-        length, pose_fn, *_ = walkers[-1]
-        x, y, _ = pose_fn(length)
-        return (x, y)
-    walker, local_s = _walker_at(walkers, cum, s)
-    _, pose_fn, *_ = walker
-    x, y, _ = pose_fn(local_s)
-    return (x, y)
+    pose = alignment_pose_at_station(alignment, station)
+    return None if pose is None else (pose[0], pose[1])
 
 
 # ---------------------------------------------------------------------------

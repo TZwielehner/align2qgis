@@ -170,6 +170,47 @@ class LandXMLMetadata:
 
     project_name: str | None = None
     landxml_version: str | None = None
+    # Source CRS declared by the file's ``<CoordinateSystem epsgCode="…">``.
+    # Used to reproject incoming coordinates into the user-picked target CRS
+    # when the two differ. ``None`` means no CRS was declared — coordinates
+    # are then assumed to already be in the target CRS.
+    source_crs_authid: str | None = None
+
+
+@dataclass
+class CgPointRecord:
+    """One ``<CgPoint>`` survey point (named control point).
+
+    Coordinates carry the LandXML ``(north, east, elev)`` triple verbatim —
+    the layer builder reprojects from ``source_crs_authid`` to the target
+    CRS, mirroring how alignments are reprojected.
+    """
+
+    name: str
+    code: str
+    north: float
+    east: float
+    elev: float | None
+    group_name: str | None = None  # parent <CgPoints name="…">
+    group_desc: str | None = None  # parent <CgPoints desc="…">
+
+
+@dataclass
+class CrossSectionSurface:
+    """One ``<CrossSectSurf>`` inside a ``<CrossSect sta="…">`` element.
+
+    A surface (e.g. Planum, Bettung, Schwelle) is a list of polyline parts
+    expressed in cross-section-local (offset, elevation) coordinates. The
+    layer builder projects each part onto the alignment's perpendicular at
+    ``station`` to place the line in map space.
+    """
+
+    alignment_name: str
+    station: float
+    name: str
+    desc: str
+    # Each entry is one ``<PntList2D>`` polyline as (offset, elevation) pairs.
+    parts: list[list[tuple[float, float]]] = field(default_factory=list)
 
 
 @dataclass
@@ -628,11 +669,77 @@ def _root_from_source(source: str | bytes) -> ET.Element:
 def _parse_metadata(root: ET.Element) -> LandXMLMetadata:
     version = root.attrib.get("version") if _strip_ns(root.tag) == "LandXML" else None
     project_name: str | None = None
+    source_crs_authid: str | None = None
     for child in root:
-        if _strip_ns(child.tag) == "Project":
+        tag = _strip_ns(child.tag)
+        if tag == "Project" and project_name is None:
             project_name = child.attrib.get("name") or None
-            break
-    return LandXMLMetadata(project_name=project_name, landxml_version=version)
+        elif tag == "CoordinateSystem" and source_crs_authid is None:
+            epsg = (child.attrib.get("epsgCode") or "").strip()
+            if epsg.isdigit():
+                source_crs_authid = f"EPSG:{epsg}"
+    return LandXMLMetadata(
+        project_name=project_name,
+        landxml_version=version,
+        source_crs_authid=source_crs_authid,
+    )
+
+
+def peek_source_crs(source: str | bytes) -> str | None:
+    """Return the source CRS authid declared in ``<CoordinateSystem epsgCode>``,
+    or ``None`` when the file declares no usable CRS. Cheap header-only read —
+    intended for prefilling the import dialog before the user clicks OK.
+    """
+    try:
+        root = _root_from_source(source)
+    except Exception:
+        return None
+    return _parse_metadata(root).source_crs_authid
+
+
+def _parse_offset_elev_pairs(text: str | None) -> list[tuple[float, float]]:
+    """Whitespace-split text into ``(offset, elevation)`` pairs.
+
+    Returns ``[]`` for empty input or unparseable pairs. Used by both the
+    CrossSect ``PntList3D`` and CrossSectSurf ``PntList2D`` readers; the
+    "3D" variant ignores the third number per pair, matching LandXML's
+    rule that the extra column is optional metadata.
+    """
+    if not text:
+        return []
+    nums = text.split()
+    out: list[tuple[float, float]] = []
+    for i in range(0, len(nums) - 1, 2):
+        try:
+            out.append((float(nums[i]), float(nums[i + 1])))
+        except ValueError:
+            continue
+    return out
+
+
+def _iter_cross_sects(root: ET.Element) -> Iterator[tuple[str, float, ET.Element]]:
+    """Yield ``(alignment_name, station, CrossSect element)`` triples.
+
+    Shared by :func:`_parse_cross_sections_from_root` and
+    :func:`_parse_cross_section_surfaces_from_root` so the
+    Alignment → CrossSects → CrossSect walk lives in one place.
+    """
+    for alignments_node in root.iter():
+        if _strip_ns(alignments_node.tag) != "Alignment":
+            continue
+        align_name = alignments_node.attrib.get("name") or "Alignment"
+        for child in alignments_node:
+            if _strip_ns(child.tag) != "CrossSects":
+                continue
+            for xs in child:
+                if _strip_ns(xs.tag) != "CrossSect":
+                    continue
+                sta_attr = xs.attrib.get("sta") or xs.attrib.get("station")
+                try:
+                    station = float(sta_attr) if sta_attr else 0.0
+                except ValueError:
+                    continue
+                yield align_name, station, xs
 
 
 def parse_alignments(source: str | bytes) -> list[Alignment]:
@@ -648,9 +755,13 @@ def parse_alignments_with_meta(
     source: str | bytes,
 ) -> tuple[list[Alignment], LandXMLMetadata]:
     """Same as :func:`parse_alignments` but also returns header metadata."""
-    root = _root_from_source(source)
-    meta = _parse_metadata(root)
+    return _parse_alignments_with_meta_from_root(_root_from_source(source))
 
+
+def _parse_alignments_with_meta_from_root(
+    root: ET.Element,
+) -> tuple[list[Alignment], LandXMLMetadata]:
+    meta = _parse_metadata(root)
     alignments: list[Alignment] = []
     for alignments_node in root.iter():
         if _strip_ns(alignments_node.tag) != "Alignment":
@@ -686,41 +797,132 @@ def parse_cross_sections(source: str | bytes) -> list[CrossSectionSample]:
     ``offset elevation [extra]``; when that's missing we still emit a single
     on-centreline sample so downstream code sees the station exists.
     """
-    root = _root_from_source(source)
+    return _parse_cross_sections_from_root(_root_from_source(source))
+
+
+def _parse_cross_sections_from_root(root: ET.Element) -> list[CrossSectionSample]:
     out: list[CrossSectionSample] = []
-    for alignments_node in root.iter():
-        if _strip_ns(alignments_node.tag) != "Alignment":
-            continue
-        align_name = alignments_node.attrib.get("name") or "Alignment"
-        for child in alignments_node:
-            if _strip_ns(child.tag) != "CrossSects":
-                continue
-            for xs in child:
-                if _strip_ns(xs.tag) != "CrossSect":
-                    continue
-                sta_attr = xs.attrib.get("sta") or xs.attrib.get("station")
-                try:
-                    station = float(sta_attr) if sta_attr else 0.0
-                except ValueError:
-                    continue
-                pnt_list = _child(xs, "PntList3D")
-                samples_added = 0
-                if pnt_list is not None and pnt_list.text:
-                    nums = pnt_list.text.split()
-                    for i in range(0, len(nums) - 1, 2):
-                        try:
-                            off = float(nums[i])
-                            elev = float(nums[i + 1])
-                        except ValueError:
-                            continue
-                        out.append(CrossSectionSample(
-                            alignment_name=align_name, station=station,
-                            offset=off, elevation=elev,
-                        ))
-                        samples_added += 1
-                if samples_added == 0:
-                    out.append(CrossSectionSample(
-                        alignment_name=align_name, station=station,
-                        offset=0.0, elevation=0.0,
-                    ))
+    for align_name, station, xs in _iter_cross_sects(root):
+        pnt_list = _child(xs, "PntList3D")
+        pairs = _parse_offset_elev_pairs(pnt_list.text if pnt_list is not None else None)
+        if pairs:
+            for off, elev in pairs:
+                out.append(CrossSectionSample(
+                    alignment_name=align_name, station=station,
+                    offset=off, elevation=elev,
+                ))
+        else:
+            out.append(CrossSectionSample(
+                alignment_name=align_name, station=station,
+                offset=0.0, elevation=0.0,
+            ))
     return out
+
+
+def parse_cg_points(source: str | bytes) -> list[CgPointRecord]:
+    """Parse every ``<CgPoint>`` under any ``<CgPoints>`` collection.
+
+    LandXML allows multiple ``<CgPoints>`` groups (each with its own
+    ``name`` / ``desc``) so the group attributes ride along on every record
+    — they become per-feature columns in the layer.
+    """
+    return _parse_cg_points_from_root(_root_from_source(source))
+
+
+def _parse_cg_points_from_root(root: ET.Element) -> list[CgPointRecord]:
+    out: list[CgPointRecord] = []
+    for group in root.iter():
+        if _strip_ns(group.tag) != "CgPoints":
+            continue
+        group_name = group.attrib.get("name") or None
+        group_desc = group.attrib.get("desc") or None
+        for pt in group:
+            if _strip_ns(pt.tag) != "CgPoint":
+                continue
+            nums = (pt.text or "").split()
+            if len(nums) < 2:
+                continue
+            try:
+                north = float(nums[0])
+                east = float(nums[1])
+                elev = float(nums[2]) if len(nums) >= 3 else None
+            except ValueError:
+                continue
+            out.append(CgPointRecord(
+                name=pt.attrib.get("name") or "",
+                code=pt.attrib.get("code") or "",
+                north=north, east=east, elev=elev,
+                group_name=group_name, group_desc=group_desc,
+            ))
+    return out
+
+
+def parse_cross_section_surfaces(source: str | bytes) -> list[CrossSectionSurface]:
+    """Parse ``<CrossSectSurf>`` elements grouped by alignment + station.
+
+    Each ``<CrossSect sta="…">`` may contain several ``<CrossSectSurf>``
+    elements (Planum, Bettung, Schwelle, …), and each surface may carry
+    one or more ``<PntList2D>`` runs — we keep each run as its own polyline
+    part so multipart surfaces render correctly.
+    """
+    return _parse_cross_section_surfaces_from_root(_root_from_source(source))
+
+
+def _parse_cross_section_surfaces_from_root(
+    root: ET.Element,
+) -> list[CrossSectionSurface]:
+    out: list[CrossSectionSurface] = []
+    for align_name, station, xs in _iter_cross_sects(root):
+        for surf in xs:
+            if _strip_ns(surf.tag) != "CrossSectSurf":
+                continue
+            parts: list[list[tuple[float, float]]] = []
+            for pnt_list in surf:
+                if _strip_ns(pnt_list.tag) != "PntList2D":
+                    continue
+                run = _parse_offset_elev_pairs(pnt_list.text)
+                if len(run) >= 2:
+                    parts.append(run)
+            if not parts:
+                continue
+            out.append(CrossSectionSurface(
+                alignment_name=align_name,
+                station=station,
+                name=surf.attrib.get("name") or "",
+                desc=surf.attrib.get("desc") or "",
+                parts=parts,
+            ))
+    return out
+
+
+@dataclass
+class ParsedLandXML:
+    """Bundle of every entity ``parse_landxml`` extracts in one DOM walk.
+
+    Lets the plugin's import pipeline parse the file exactly once instead
+    of paying the XML tokenization cost per public ``parse_*`` call.
+    """
+
+    alignments: list[Alignment]
+    meta: LandXMLMetadata
+    cross_sections: list[CrossSectionSample]
+    cross_section_surfaces: list[CrossSectionSurface]
+    cg_points: list[CgPointRecord]
+
+
+def parse_landxml(source: str | bytes) -> ParsedLandXML:
+    """Parse alignments + cross sections + surfaces + CgPoints in one pass.
+
+    Cheaper than calling each ``parse_*`` separately when more than one
+    entity is needed — the XML is tokenised once and every sub-parser
+    operates on the shared in-memory tree.
+    """
+    root = _root_from_source(source)
+    alignments, meta = _parse_alignments_with_meta_from_root(root)
+    return ParsedLandXML(
+        alignments=alignments,
+        meta=meta,
+        cross_sections=_parse_cross_sections_from_root(root),
+        cross_section_surfaces=_parse_cross_section_surfaces_from_root(root),
+        cg_points=_parse_cg_points_from_root(root),
+    )

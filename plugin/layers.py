@@ -21,6 +21,7 @@ from qgis.core import (
     QgsField,
     QgsGeometry,
     QgsLineString,
+    QgsMultiLineString,
     QgsPoint,
     QgsPointXY,
     QgsVectorLayer,
@@ -34,6 +35,7 @@ from .geometry_builder import (
     alignment_chainage,
     alignment_curve_pieces,
     alignment_curve_pieces_3d,
+    alignment_pose_at_station,
     alignment_xy_at_station,
     internal_to_display,
     segment_curvature,
@@ -41,6 +43,8 @@ from .geometry_builder import (
     segment_length,
 )
 from .landxml_parser import (
+    CgPointRecord,
+    CrossSectionSurface,
     CurveSeg,
     LandXMLMetadata,
     SpiralSeg,
@@ -48,6 +52,8 @@ from .landxml_parser import (
     profile_elevation_at_station,
 )
 from .stationing import format_station, upright_bearing
+
+import math
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +167,12 @@ def _batch_is_3d(alignments) -> bool:
     promote the whole layer and give profileless alignments a Z=0 fallback.
     """
     return any(getattr(a, "profile", None) is not None for a in alignments)
+
+
+def _alignments_by_name(alignments) -> dict[str, object]:
+    """Return ``{alignment.name: alignment}`` so per-station lookups can
+    avoid linear scans across the alignment list."""
+    return {a.name: a for a in alignments}
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +669,7 @@ def build_cross_sections_layer(
         "PointZ" if is_3d else "Point",
         cross_sections_fields(),
     )
-    by_name = {a.name: a for a in alignments}
+    by_name = _alignments_by_name(alignments)
     features: list[QgsFeature] = []
     for cs in cross_sections:
         alignment = by_name.get(cs.alignment_name)
@@ -676,6 +688,128 @@ def build_cross_sections_layer(
         feat.setAttribute("station", cs.station)
         feat.setAttribute("offset", cs.offset)
         feat.setAttribute("elevation", cs.elevation)
+        features.append(feat)
+    layer.dataProvider().addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+def cg_point_fields() -> list[QgsField]:
+    return [
+        QgsField("name", QMetaType.Type.QString),
+        QgsField("code", QMetaType.Type.QString),
+        QgsField("elev", QMetaType.Type.Double),
+        QgsField("group_name", QMetaType.Type.QString),
+        QgsField("group_desc", QMetaType.Type.QString),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+    ]
+
+
+def build_cg_points_layer(
+    points: list[CgPointRecord],
+    layer_name: str,
+    crs_authid: str,
+    *,
+    source_file: str = "",
+) -> QgsVectorLayer:
+    """One point feature per ``<CgPoint>`` (named survey / control point).
+
+    Promoted to ``PointZ`` whenever any record carries an elevation; missing
+    elevations fall back to Z=0 so the layer's geometry type stays uniform.
+    Coordinates are expected to already be in ``crs_authid`` — the plugin
+    reprojects from the source CRS before calling this builder, matching how
+    alignment segments are handled.
+    """
+    is_3d = any(p.elev is not None for p in points)
+    layer = _new_memory_layer(
+        layer_name, crs_authid,
+        "PointZ" if is_3d else "Point",
+        cg_point_fields(),
+    )
+    features: list[QgsFeature] = []
+    for p in points:
+        feat = QgsFeature(layer.fields())
+        # LandXML stores (N, E); QGIS map XY is (E, N).
+        if is_3d:
+            z = float(p.elev) if p.elev is not None else 0.0
+            feat.setGeometry(QgsGeometry(QgsPoint(p.east, p.north, z)))
+        else:
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(p.east, p.north)))
+        feat.setAttribute("name", p.name)
+        feat.setAttribute("code", p.code)
+        feat.setAttribute("elev", float(p.elev) if p.elev is not None else None)
+        feat.setAttribute("group_name", p.group_name)
+        feat.setAttribute("group_desc", p.group_desc)
+        feat.setAttribute(SOURCE_FILE_FIELD, source_file)
+        features.append(feat)
+    layer.dataProvider().addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+def cross_section_surface_fields() -> list[QgsField]:
+    return [
+        QgsField("alignment", QMetaType.Type.QString),
+        QgsField("station", QMetaType.Type.Double),
+        QgsField("surf_name", QMetaType.Type.QString),
+        QgsField("desc", QMetaType.Type.QString),
+        QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
+    ]
+
+
+def build_cross_section_surfaces_layer(
+    surfaces: list[CrossSectionSurface],
+    alignments,
+    layer_name: str,
+    crs_authid: str,
+    *,
+    source_file: str = "",
+) -> QgsVectorLayer:
+    """Multi-part LineStringZ layer — one feature per ``<CrossSectSurf>``.
+
+    The (offset, elevation) pairs from each ``<PntList2D>`` are projected
+    onto the alignment's right-perpendicular at the cross-section's station,
+    so the surface plots across the alignment at the right place in map
+    space. Offset sign follows the LandXML convention (right-positive in
+    direction of stationing); the alignment's bearing at the station
+    controls the perpendicular's orientation.
+    """
+    layer = _new_memory_layer(
+        layer_name, crs_authid, "MultiLineStringZ", cross_section_surface_fields(),
+    )
+    by_name = _alignments_by_name(alignments)
+    features: list[QgsFeature] = []
+    for surf in surfaces:
+        alignment = by_name.get(surf.alignment_name)
+        if alignment is None:
+            continue
+        pose = alignment_pose_at_station(alignment, surf.station)
+        if pose is None:
+            continue
+        cx, cy, bearing_deg = pose
+        b = math.radians(bearing_deg)
+        rx, ry = math.sin(b), -math.cos(b)
+
+        mls = QgsMultiLineString()
+        added = 0
+        for run in surf.parts:
+            pts = [
+                QgsPoint(cx + off * rx, cy + off * ry, elev)
+                for off, elev in run
+            ]
+            if len(pts) < 2:
+                continue
+            mls.addGeometry(QgsLineString(pts))
+            added += 1
+        if added == 0:
+            continue
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(QgsGeometry(mls.clone()))
+        feat.setAttribute("alignment", surf.alignment_name)
+        feat.setAttribute("station", surf.station)
+        feat.setAttribute("surf_name", surf.name)
+        feat.setAttribute("desc", surf.desc)
+        feat.setAttribute(SOURCE_FILE_FIELD, source_file)
         features.append(feat)
     layer.dataProvider().addFeatures(features)
     layer.updateExtents()

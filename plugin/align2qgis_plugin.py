@@ -12,6 +12,7 @@ together. The actual work is delegated to the focused modules:
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -25,15 +26,22 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     Qgis,
     QgsApplication,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsFeature,
     QgsMapLayer,
+    QgsMessageLog,
+    QgsPointXY,
     QgsProject,
     QgsVectorLayer,
 )
 
 from .constants import (
     ALIGNMENT_LAYER_PREFIX,
+    CANONICAL_LAYERS,
+    CG_POINTS_LAYER,
     CHAINAGE_LABEL_LAYER,
+    CROSS_SECTION_SURFACES_LAYER,
     CROSS_SECTIONS_LAYER,
     DIMENSIONS_LAYER_PREFIX,
     PLUGIN_NAME,
@@ -47,10 +55,15 @@ from .constants import (
 from .gpkg_writer import write_layers_to_gpkg
 from .import_dialog import Align2QgisImportDialog, ImportOptions
 from .processing.provider import Align2QgisProvider
-from .landxml_parser import inspect_landxml, parse_alignments_with_meta, parse_cross_sections
+from .landxml_parser import (
+    inspect_landxml,
+    parse_landxml,
+)
 from .layers import (
     build_alignment_layer,
+    build_cg_points_layer,
     build_chainage_label_layer,
+    build_cross_section_surfaces_layer,
     build_cross_sections_layer,
     build_dimension_layer,
     build_segment_layer,
@@ -69,7 +82,9 @@ if TYPE_CHECKING:
     from qgis.gui import QgisInterface
 
 
-_SUPPORTED_INSPECT_TAGS = {"Alignment", "Profile"}
+_SUPPORTED_INSPECT_TAGS = {
+    "Alignment", "Profile", "CgPoint", "CrossSectSurf",
+}
 
 # Layer-kind tags used by _apply_styling to pick the right symbology / labels.
 _KIND_ALIGNMENT = "alignment"
@@ -79,6 +94,8 @@ _KIND_DIMENSIONS = "dimensions"
 _KIND_CHAINAGE = "chainage"
 _KIND_VERTICAL_PROFILE = "vertical_profile"
 _KIND_CROSS_SECTIONS = "cross_sections"
+_KIND_CROSS_SECTION_SURFACES = "cross_section_surfaces"
+_KIND_CG_POINTS = "cg_points"
 
 
 class Align2QgisPlugin:
@@ -385,7 +402,9 @@ class Align2QgisPlugin:
             f"{PLUGIN_NAME} — {os.path.basename(path)}",
             "Element counts:\n\n" + "\n".join(rows) + "\n\n"
             "Currently imported: Alignment (horizontal + chainage + dimensions"
-            " + segments) and Profile (vertical, shown in the profile dock).\n"
+            " + segments), Profile (vertical, shown in the profile dock),"
+            " CgPoint (named survey points) and CrossSectSurf (cross-section"
+            " surfaces — Planum, Bettung, …).\n"
             "Other element types are present in the file but not yet imported;"
             " ask if you'd like one wired up.",
         )
@@ -400,35 +419,74 @@ class Align2QgisPlugin:
         if preset_path:
             dlg.path_edit.setText(preset_path)
             dlg.crs_edit.setText(default_crs)
+            dlg._update_detected_hint()
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
         dlg.persist()
         return dlg.options()
 
     def _process(self, opts: ImportOptions) -> None:
+        # Wall-clock checkpoints. Logged to the "Align2QGIS" Message Log
+        # panel so we can see exactly which stage dominates a slow import
+        # without having to run a profiler.
+        timings: list[tuple[str, float]] = []
+        t_total_start = time.perf_counter()
+        t = time.perf_counter()
+
         parsed = self._parse_or_error(opts.landxml_path)
+        timings.append(("parse_landxml", time.perf_counter() - t))
         if parsed is None:
             return
-        alignments, meta = parsed
+        alignments = parsed.alignments
+
+        # Dialog CRS = the CRS the LandXML coordinates are in (auto-filled
+        # from <CoordinateSystem epsgCode> when the user picks a file; can
+        # be overridden). When an existing canonical layer / GeoPackage
+        # table is in a different CRS, transform LandXML data from the
+        # dialog CRS into that existing CRS so all rows in the table share
+        # one CRS (GeoPackage allows only one CRS per table).
+        t = time.perf_counter()
+        conflict = self._detect_crs_conflict(opts)
+        timings.append(("crs_conflict_probe", time.perf_counter() - t))
+        xform = None
+        reprojected_from: str | None = None
+        if conflict is not None:
+            existing_name, target_crs = conflict
+            xform = self._build_transform(opts.crs_authid, target_crs)
+            if xform is None:
+                QMessageBox.critical(
+                    self.iface.mainWindow(), PLUGIN_NAME,
+                    f"Can't transform from {opts.crs_authid} to existing "
+                    f"'{existing_name}' CRS {target_crs} — one or both CRSs "
+                    f"are invalid. Fix the dialog CRS or remove the "
+                    f"conflicting layers.",
+                )
+                return
+            self.iface.messageBar().pushMessage(
+                PLUGIN_NAME,
+                f"Transforming LandXML data from {opts.crs_authid} into "
+                f"existing '{existing_name}' CRS {target_crs}.",
+                level=Qgis.MessageLevel.Info, duration=8,
+            )
+            reprojected_from = opts.crs_authid
+            opts.crs_authid = target_crs
+            t = time.perf_counter()
+            self._reproject_alignments(alignments, xform)
+            self._reproject_cg_points(parsed.cg_points, xform)
+            timings.append(("reproject", time.perf_counter() - t))
 
         base = os.path.basename(opts.landxml_path)
+        t = time.perf_counter()
         replaced = self._purge_existing(opts.landxml_path)
+        timings.append(("purge_existing", time.perf_counter() - t))
 
-        try:
-            with open(opts.landxml_path, "rb") as fh:
-                xml_bytes = fh.read()
-            cross_sections = parse_cross_sections(xml_bytes)
-        except Exception:
-            cross_sections = []
-
-        # Build fresh memory layers from this import. Each carries the
-        # source_file column so the per-import purge can find them later.
         imported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        new_layers = self._build_layers(
-            alignments, cross_sections, opts, base, imported_at, meta,
-        )
+        t = time.perf_counter()
+        new_layers = self._build_layers(parsed, opts, base, imported_at)
+        timings.append(("build_layers", time.perf_counter() - t))
 
         project = QgsProject.instance()
+        t = time.perf_counter()
         try:
             target = self._register_layers(project, new_layers, opts)
         except IOError as exc:
@@ -437,13 +495,26 @@ class Align2QgisPlugin:
                 f"GeoPackage write failed:\n{exc}",
             )
             return
+        timings.append(("register_layers", time.perf_counter() - t))
 
         self._refresh_dock_combo()
 
+        total = time.perf_counter() - t_total_start
+        QgsMessageLog.logMessage(
+            "Import timings: "
+            + " | ".join(f"{name}={ms*1000:.0f}ms" for name, ms in timings)
+            + f" | total={total*1000:.0f}ms",
+            PLUGIN_NAME, Qgis.MessageLevel.Info,
+        )
+
         n_align = len(alignments)
         action = "Re-applied" if replaced else "Imported"
+        reproj_note = (
+            f", reprojected {reprojected_from} → {opts.crs_authid}"
+            if reprojected_from else ""
+        )
         msg = (
-            f"{action} {n_align} alignment(s) from {base} → "
+            f"{action} {n_align} alignment(s) from {base}{reproj_note} → "
             f"{len(new_layers)} layer(s) ({target})"
         )
         self.iface.messageBar().pushMessage(
@@ -454,30 +525,31 @@ class Align2QgisPlugin:
         try:
             with open(path, "rb") as fh:
                 xml_bytes = fh.read()
-            alignments, meta = parse_alignments_with_meta(xml_bytes)
+            parsed = parse_landxml(xml_bytes)
         except Exception as exc:  # broad: surface parse errors to user
             QMessageBox.critical(
                 self.iface.mainWindow(), PLUGIN_NAME,
                 f"Failed to parse LandXML:\n{exc}",
             )
             return None
-        if not alignments:
+        if not parsed.alignments:
             QMessageBox.information(
                 self.iface.mainWindow(), PLUGIN_NAME,
                 "No <Alignment> elements found in file.",
             )
             return None
-        return alignments, meta
+        return parsed
 
     def _build_layers(
-        self, alignments, cross_sections, opts: ImportOptions, base: str,
-        imported_at: str, meta,
+        self, parsed, opts: ImportOptions, base: str, imported_at: str,
     ) -> list[tuple[QgsVectorLayer, str, str, bool]]:
         """Return ``[(layer, canonical_name, kind, persist_to_gpkg), …]``.
 
         ``persist_to_gpkg`` is False for the auxiliary in-memory chainage
         label layer; everything else gets written to the GeoPackage.
         """
+        alignments = parsed.alignments
+        meta = parsed.meta
         crs = opts.crs_authid
         tag = lambda layer: tag_layer(layer, opts.landxml_path, crs)  # noqa: E731
 
@@ -535,9 +607,24 @@ class Align2QgisPlugin:
         out.append((vp_layer, VERTICAL_PROFILE_LAYER, _KIND_VERTICAL_PROFILE, True))
 
         xs_layer = tag(build_cross_sections_layer(
-            cross_sections, alignments, CROSS_SECTIONS_LAYER, crs, source_file=base,
+            parsed.cross_sections, alignments,
+            CROSS_SECTIONS_LAYER, crs, source_file=base,
         ))
         out.append((xs_layer, CROSS_SECTIONS_LAYER, _KIND_CROSS_SECTIONS, True))
+
+        if parsed.cross_section_surfaces:
+            xss_layer = tag(build_cross_section_surfaces_layer(
+                parsed.cross_section_surfaces, alignments,
+                CROSS_SECTION_SURFACES_LAYER, crs, source_file=base,
+            ))
+            out.append((xss_layer, CROSS_SECTION_SURFACES_LAYER,
+                        _KIND_CROSS_SECTION_SURFACES, True))
+
+        if parsed.cg_points:
+            cg_layer = tag(build_cg_points_layer(
+                parsed.cg_points, CG_POINTS_LAYER, crs, source_file=base,
+            ))
+            out.append((cg_layer, CG_POINTS_LAYER, _KIND_CG_POINTS, True))
 
         return out
 
@@ -643,6 +730,79 @@ class Align2QgisPlugin:
         elif kind == _KIND_DIMENSIONS:
             apply_dimension_labels(layer)
 
+    @staticmethod
+    def _build_transform(
+        src_authid: str | None, dst_authid: str,
+    ) -> QgsCoordinateTransform | None:
+        """Return a QgsCoordinateTransform from ``src`` to ``dst``, or None
+        when no transform is needed (missing src, identical CRSs, invalid
+        either side). Centralises the no-op semantics shared by both
+        reproject helpers."""
+        if not src_authid or src_authid == dst_authid:
+            return None
+        src_crs = QgsCoordinateReferenceSystem(src_authid)
+        dst_crs = QgsCoordinateReferenceSystem(dst_authid)
+        if not src_crs.isValid() or not dst_crs.isValid():
+            return None
+        return QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
+
+    @staticmethod
+    def _reproject_alignments(alignments, xform: QgsCoordinateTransform) -> None:
+        """Transform every segment endpoint (N, E) in place. LandXML stores
+        (N, E); QGIS map XY is (E, N) — swap before and after the
+        transform so the rest of the geometry stack keeps the LandXML
+        convention."""
+        def t(p):
+            if p is None:
+                return None
+            q = xform.transform(QgsPointXY(p[1], p[0]))
+            return (q.y(), q.x())
+
+        for align in alignments:
+            for seg in align.segments:
+                seg.start = t(seg.start)
+                seg.end = t(seg.end)
+                center = getattr(seg, "center", None)
+                if center is not None:
+                    seg.center = t(center)
+                pi = getattr(seg, "pi", None)
+                if pi is not None:
+                    seg.pi = t(pi)
+
+    @staticmethod
+    def _reproject_cg_points(points, xform: QgsCoordinateTransform) -> None:
+        """In-place CgPoint (N, E) reprojection — same swap convention as
+        :meth:`_reproject_alignments`."""
+        for p in points:
+            q = xform.transform(QgsPointXY(p.east, p.north))
+            p.east = q.x()
+            p.north = q.y()
+
+    def _detect_crs_conflict(self, opts: ImportOptions) -> tuple[str, str] | None:
+        """Return ``(layer_name, existing_crs_authid)`` if any canonical layer
+        already exists with a CRS different from ``opts.crs_authid``. Checks
+        both the in-project layers and the on-disk GeoPackage tables.
+        """
+        project = QgsProject.instance()
+        for name in CANONICAL_LAYERS:
+            existing = self._find_named_layer(project, name)
+            if existing is None:
+                continue
+            authid = existing.crs().authid()
+            if authid and authid != opts.crs_authid:
+                return (name, authid)
+        if opts.gpkg_path and os.path.exists(opts.gpkg_path):
+            for name in CANONICAL_LAYERS:
+                probe = QgsVectorLayer(
+                    f"{opts.gpkg_path}|layername={name}", name, "ogr",
+                )
+                if not probe.isValid():
+                    continue
+                authid = probe.crs().authid()
+                if authid and authid != opts.crs_authid:
+                    return (name, authid)
+        return None
+
     def _purge_existing(self, source_path: str) -> int:
         """Delete rows whose ``source_file`` matches ``source_path``'s basename
         from each canonical-named layer in the project. Idempotent: missing
@@ -653,11 +813,7 @@ class Align2QgisPlugin:
         project = QgsProject.instance()
         base = os.path.basename(source_path)
         touched = 0
-        for layer_name in (
-            ALIGNMENT_LAYER_PREFIX, SEGMENTS_LAYER_PREFIX,
-            STATIONS_LAYER_PREFIX, DIMENSIONS_LAYER_PREFIX,
-            CHAINAGE_LABEL_LAYER, VERTICAL_PROFILE_LAYER, CROSS_SECTIONS_LAYER,
-        ):
+        for layer_name in CANONICAL_LAYERS:
             layer = self._find_named_layer(project, layer_name)
             if layer is None:
                 continue
