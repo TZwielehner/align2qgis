@@ -148,6 +148,20 @@ def _high_low_point(
     return sta, elev, dg < 0
 
 
+def _annotate(ax, text: str, xy, xytext, *, ha: str, va: str,
+              color: str, zorder: int, **kwargs) -> None:
+    """``ax.annotate`` with the dock's shared defaults.
+
+    Every profile annotation places offset-points text at ``fontsize=7``;
+    only the anchor, alignment, colour, and stacking vary. Extra matplotlib
+    kwargs (``bbox``, ``xycoords``, ``rotation``) pass straight through.
+    """
+    ax.annotate(
+        text, xy=xy, xytext=xytext, textcoords="offset points",
+        ha=ha, va=va, fontsize=7, color=color, zorder=zorder, **kwargs,
+    )
+
+
 class Align2QgisProfileDock(QDockWidget):
     """Floating/dock widget showing curvature + vertical profile of an alignment."""
 
@@ -649,28 +663,37 @@ class Align2QgisProfileDock(QDockWidget):
     def _draw_pvi_annotations(self, ax) -> None:
         """Static annotations on the elevation plot.
 
-        Adds four layers, each tied to one pass over ``_pvi_items``:
-        PVI dots labelled with (station, elev), grade-percent labels
-        centred on each tangent run, ``L = / R =`` callouts under every
-        VertCurve PVI, and crest / sag diamonds at the parabola extremum
-        when it falls strictly inside the curve. The PVI dot sits at the
-        LandXML vertex elevation, not on the parabola — the offset is
-        useful for surveyors comparing the design vertex to the smoothed
-        through-curve elevation.
+        Four independent passes over ``_pvi_items``, one helper each: PVI
+        dots labelled with (station, elev), grade-percent labels centred on
+        each tangent run, ``L = / R =`` callouts under every VertCurve PVI,
+        and crest / sag diamonds at the parabola extremum when it falls
+        strictly inside the curve. The PVI dot sits at the LandXML vertex
+        elevation, not on the parabola — the offset is useful for surveyors
+        comparing the design vertex to the smoothed through-curve elevation.
         """
         items = self._pvi_items
         if not items:
             return
+        self._draw_pvi_dots(ax, items)
+        self._draw_grade_labels(ax, items)
+        self._draw_vc_callouts(ax, items)
+        self._draw_crest_sag(ax, items)
+
+    @staticmethod
+    def _draw_pvi_dots(ax, items) -> None:
+        """Vertex dot + (station, elev) label at each PVI."""
         for it in items:
             ax.plot(it.station, it.elev, "o", markersize=4, color=_COLOR_PROFILE,
                     markeredgecolor="white", markeredgewidth=0.6, zorder=4)
-            ax.annotate(
-                f"{it.station:,.0f}\n{it.elev:.2f}",
-                xy=(it.station, it.elev),
-                xytext=(0, 8), textcoords="offset points",
-                ha="center", va="bottom", fontsize=7, color=_COLOR_PROFILE,
-                zorder=4,
+            _annotate(
+                ax, f"{it.station:,.0f}\n{it.elev:.2f}",
+                xy=(it.station, it.elev), xytext=(0, 8),
+                ha="center", va="bottom", color=_COLOR_PROFILE, zorder=4,
             )
+
+    @staticmethod
+    def _draw_grade_labels(ax, items) -> None:
+        """Grade-percent label centred on each tangent run between PVIs."""
         for a, b in zip(items, items[1:]):
             dx = b.station - a.station
             if dx <= 0:
@@ -678,28 +701,32 @@ class Align2QgisProfileDock(QDockWidget):
             grade_pct = (b.elev - a.elev) / dx * 100.0
             mid_sta = 0.5 * (a.station + b.station)
             mid_elev = 0.5 * (a.elev + b.elev)
-            ax.annotate(
-                f"{grade_pct:+.2f} %",
-                xy=(mid_sta, mid_elev),
-                xytext=(0, -10), textcoords="offset points",
-                ha="center", va="top", fontsize=7, color="#444",
+            _annotate(
+                ax, f"{grade_pct:+.2f} %",
+                xy=(mid_sta, mid_elev), xytext=(0, -10),
+                ha="center", va="top", color="#444", zorder=3,
                 bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
                           edgecolor="none", alpha=0.7),
-                zorder=3,
             )
+
+    @staticmethod
+    def _draw_vc_callouts(ax, items) -> None:
+        """``L = / R =`` callout under every real VertCurve PVI."""
         for it in items:
             if not _is_real_vertcurve(it):
                 continue
             label = f"L = {it.length:g} m"
             if it.radius is not None and it.radius > 0:
                 label += f"\nR = {it.radius:g} m"
-            ax.annotate(
-                label,
-                xy=(it.station, it.elev),
-                xytext=(0, -22), textcoords="offset points",
-                ha="center", va="top", fontsize=7, color=_COLOR_NEUTRAL,
-                zorder=3,
+            _annotate(
+                ax, label,
+                xy=(it.station, it.elev), xytext=(0, -22),
+                ha="center", va="top", color=_COLOR_NEUTRAL, zorder=3,
             )
+
+    @staticmethod
+    def _draw_crest_sag(ax, items) -> None:
+        """Crest / sag diamond at each interior VertCurve's parabola extremum."""
         for i, it in enumerate(items):
             if not _is_real_vertcurve(it):
                 continue
@@ -712,12 +739,10 @@ class Align2QgisProfileDock(QDockWidget):
             color = _COLOR_CREST if is_crest else _COLOR_SAG
             ax.plot(sta, elev, marker="D", markersize=5, color=color,
                     markeredgecolor="white", markeredgewidth=0.6, zorder=5)
-            ax.annotate(
-                f"{'crest' if is_crest else 'sag'}\n{sta:,.0f} / {elev:.2f}",
-                xy=(sta, elev),
-                xytext=(6, 0), textcoords="offset points",
-                ha="left", va="center", fontsize=7, color=color,
-                zorder=5,
+            _annotate(
+                ax, f"{'crest' if is_crest else 'sag'}\n{sta:,.0f} / {elev:.2f}",
+                xy=(sta, elev), xytext=(6, 0),
+                ha="left", va="center", color=color, zorder=5,
             )
 
     def _draw_equation_marks(self, ax) -> None:
@@ -727,12 +752,11 @@ class Align2QgisProfileDock(QDockWidget):
         for eq in self._equations:
             ax.axvline(eq.sta_back, color=_COLOR_GUIDE, linestyle="--",
                        linewidth=0.8, alpha=0.7, zorder=2)
-            ax.annotate(
-                f"{eq.sta_back:,.0f} → {eq.sta_ahead:,.0f}",
+            _annotate(
+                ax, f"{eq.sta_back:,.0f} → {eq.sta_ahead:,.0f}",
                 xy=(eq.sta_back, 1.0), xycoords=("data", "axes fraction"),
-                xytext=(2, -2), textcoords="offset points",
-                ha="left", va="top", fontsize=7, color=_COLOR_NEUTRAL,
-                rotation=90, zorder=2,
+                xytext=(2, -2), ha="left", va="top",
+                color=_COLOR_NEUTRAL, zorder=2, rotation=90,
             )
 
     # ------------------------------------------------------------------

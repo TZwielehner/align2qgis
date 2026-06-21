@@ -100,6 +100,16 @@ def _new_memory_layer(
     return layer
 
 
+def _point_wkt(is_3d: bool) -> str:
+    """WKT geometry token for a point layer, Z-promoted when the batch is 3D."""
+    return "PointZ" if is_3d else "Point"
+
+
+def _curve_wkt(is_3d: bool) -> str:
+    """WKT geometry token for a compound-curve layer, Z-promoted when 3D."""
+    return "CompoundCurveZ" if is_3d else "CompoundCurve"
+
+
 def _compound_curve_from_pieces(pieces) -> QgsCompoundCurve:
     """Build a QgsCompoundCurve from a list of LinePiece / ArcPiece values.
 
@@ -215,7 +225,7 @@ def build_alignment_layer(
     is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
         layer_name, crs_authid,
-        "CompoundCurveZ" if is_3d else "CompoundCurve",
+        _curve_wkt(is_3d),
         alignment_fields(),
     )
     meta = metadata or LandXMLMetadata()
@@ -313,7 +323,7 @@ def build_segment_layer(
     is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
         layer_name, crs_authid,
-        "CompoundCurveZ" if is_3d else "CompoundCurve",
+        _curve_wkt(is_3d),
         segment_fields(),
     )
 
@@ -441,7 +451,7 @@ def build_stations_layer(
     """
     is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
-        layer_name, crs_authid, "PointZ" if is_3d else "Point", stations_fields(),
+        layer_name, crs_authid, _point_wkt(is_3d), stations_fields(),
     )
 
     label_offset = 90.0 if perpendicular else 0.0
@@ -505,7 +515,7 @@ def build_chainage_label_layer(
     """
     is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
-        layer_name, crs_authid, "PointZ" if is_3d else "Point", stations_fields(),
+        layer_name, crs_authid, _point_wkt(is_3d), stations_fields(),
     )
 
     label_offset = 90.0 if perpendicular else 0.0
@@ -680,7 +690,7 @@ def build_cross_sections_layer(
     is_3d = _batch_is_3d(alignments)
     layer = _new_memory_layer(
         layer_name, crs_authid,
-        "PointZ" if is_3d else "Point",
+        _point_wkt(is_3d),
         cross_sections_fields(),
     )
     by_name = _alignments_by_name(alignments)
@@ -737,7 +747,7 @@ def build_cg_points_layer(
     is_3d = any(p.elev is not None for p in points)
     layer = _new_memory_layer(
         layer_name, crs_authid,
-        "PointZ" if is_3d else "Point",
+        _point_wkt(is_3d),
         cg_point_fields(),
     )
     features: list[QgsFeature] = []

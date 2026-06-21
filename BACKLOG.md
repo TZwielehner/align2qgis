@@ -12,39 +12,24 @@ than scattering TODO comments through the source.
   Acceptable for typical batches (10–100 input points × handful of
   alignments). Memoize per-segment if batch projection becomes a real
   bottleneck — e.g. cache a dense (s, x, y) lookup table on the
-  alignment when the projection algorithm runs.
+  alignment when the projection algorithm runs. Left as conditional
+  future work: it trades exact golden-section feet for table
+  interpolation, so it's an accuracy/speed call to make against a
+  measured profile, not a no-op refactor.
 
-## Layers / processing
+## Decided against (kept as a record so they aren't re-proposed)
 
-- **No constants for layer geometry-type strings.** `"CompoundCurve"`,
-  `"CompoundCurveZ"`, `"Point"`, `"PointZ"` appear at the
-  `_new_memory_layer` call sites. Skipped — these are QGIS WKT type
-  tokens, not project concepts, and adding constants for four strings
-  used at four sites is over-engineering. Reconsider only if a new
-  layer type joins them.
-
-## Profile dock
-
-- **`_KIND_COLORS` to `styling.py`.** Segment-kind palette
-  (line/curve/spiral) is hard-coded inside the dock; `styling.py` owns
-  label/marker styling for the same kinds. Unifying would centralise
-  the palette but cross-couples the dock to QGIS-only styling. Skipped
-  — the dock's matplotlib colour space is independent from QGIS
-  symbol colours, so a separate constant is honest.
-
-- **Split `_draw_pvi_annotations` into four methods.** Each section
-  (PVI dots, grade labels, VC callouts, crest/sag) is tight enough
-  that four single-call helpers would add friction without improving
-  readability. Skipped; revisit if any section grows.
-
-- **`_label_point` annotation helper.** Several `ax.annotate(...)`
-  calls share boilerplate but the per-call params (`xytext`, `ha/va`,
-  `bbox`, `color`, `zorder`) vary enough that the helper would have a
-  long signature for marginal saving. Skipped.
+- **`_KIND_COLORS` → `styling.py`.** The dock's segment-kind palette is
+  matplotlib hex strings for an independent widget plot; `styling.py`
+  speaks QGIS map symbology (`QColor` RGB tuples) and has no kind→colour
+  map to unify with. Moving it would cross-couple two unrelated rendering
+  systems and imply a shared palette that doesn't exist. Keeping the
+  dock's palette local is the honest split.
 
 - **`_high_low_point` ↔ `_grade_between` consolidation.**
-  `_high_low_point` (`profile_dock.py`) recomputes back/ahead grades
-  via inline divisions; `landxml_parser._grade_between` does the same.
-  Signatures don't align (the dock function takes prev/vc/next
-  objects, the parser helper takes a list + indices) — bridging them
-  needs a wrapper that wouldn't save lines. Skipped.
+  `_high_low_point` (`profile_dock.py`) computes back/ahead grades from
+  prev/vc/next PVI objects and must bail out (`return None`) when a
+  neighbour spacing is non-positive; `landxml_parser._grade_between`
+  takes a list + indices and returns `0.0` in that case. The differing
+  degenerate-case semantics mean a bridge would need a wrapper that
+  saves no lines and obscures the early-exit.
