@@ -4,19 +4,6 @@ Findings from `/simplify` passes that were intentionally deferred — not bugs,
 but pickup-able quality wins for a future sweep. Add new entries here rather
 than scattering TODO comments through the source.
 
-## Geometry / parser
-
-- **Spiral projection cost in `_project_to_spiral_seg`.** Each call
-  evaluates `_spiral_pose` ~74 times (24 coarse sweeps + ~50 golden-
-  section steps), and each pose call integrates the clothoid from 0.
-  Acceptable for typical batches (10–100 input points × handful of
-  alignments). Memoize per-segment if batch projection becomes a real
-  bottleneck — e.g. cache a dense (s, x, y) lookup table on the
-  alignment when the projection algorithm runs. Left as conditional
-  future work: it trades exact golden-section feet for table
-  interpolation, so it's an accuracy/speed call to make against a
-  measured profile, not a no-op refactor.
-
 ## Decided against (kept as a record so they aren't re-proposed)
 
 - **`_KIND_COLORS` → `styling.py`.** The dock's segment-kind palette is
