@@ -1,7 +1,6 @@
 """Station-equation mapping + chainage walker integration."""
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 

@@ -1,7 +1,6 @@
 """Processing algorithm: project points onto an alignment and emit (station, offset)."""
 from __future__ import annotations
 
-import math
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,

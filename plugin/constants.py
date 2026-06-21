@@ -33,6 +33,22 @@ CHAINAGE_LABEL_LAYER = "Chainage (interval)"
 # shared canonical tables. Re-import semantics delete-by-source then append.
 SOURCE_FILE_FIELD = "source_file"
 
+# Attribute names that cross the producer/consumer boundary: ``layers.py``
+# declares them in QgsField schemas and ``profile_dock.py`` reads them back
+# off the features. Centralised so a rename can't silently desync the two
+# sides. Fields with no cross-module reader stay as literals at their single
+# definition site — only the shared subset is promoted here.
+FIELD_ALIGNMENT = "alignment"
+FIELD_KIND = "kind"
+FIELD_STA_START = "sta_start"
+FIELD_STA_END = "sta_end"
+FIELD_CURVATURE_START = "curvature_start"
+FIELD_CURVATURE_END = "curvature_end"
+FIELD_RADIUS_START = "radius_start"
+FIELD_STATION = "station"
+FIELD_ELEVATION = "elevation"
+FIELD_VC_LENGTH = "vc_length"
+
 # Every canonical layer name the plugin emits — the CRS-conflict probe and
 # the per-import purge both iterate this. Single source of truth so they
 # can't drift when new entity layers are added. Defined last so every

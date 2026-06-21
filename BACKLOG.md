@@ -6,14 +6,6 @@ than scattering TODO comments through the source.
 
 ## Geometry / parser
 
-- **`_grade_between` (landxml_parser.py) duplicates the grade math in
-  `profile_samples`.** Both functions compute the back/ahead tangent
-  slope at a profile item from neighbour stations. Unifying them would
-  pull `_grade_between` (or an equivalent) into `profile_samples`'s
-  inner loop. Skipped during the 6+1 cleanup because the math is short
-  and well-isolated; sharing it touches a hot path that's already
-  tested against the densified ground truth.
-
 - **Spiral projection cost in `_project_to_spiral_seg`.** Each call
   evaluates `_spiral_pose` ~74 times (24 coarse sweeps + ~50 golden-
   section steps), and each pose call integrates the clothoid from 0.
@@ -31,30 +23,7 @@ than scattering TODO comments through the source.
   used at four sites is over-engineering. Reconsider only if a new
   layer type joins them.
 
-- **Projection helpers return a 5-tuple instead of a dataclass.**
-  `(s_local, signed_offset, foot_x, foot_y, residual)` is consistent
-  across `_project_to_line_piece` / `_project_to_curve_seg` /
-  `_project_to_spiral_seg`. A `ProjectionStep` dataclass would make
-  call sites self-documenting. Skipped because the tuple shape is
-  private to `alignment_project_point`; introduce the dataclass if a
-  new caller needs to interpret these fields directly.
-
 ## Profile dock
-
-- **Layer field-name constants.** `profile_dock.py` reads
-  ``feat["alignment"]``, ``feat["sta_start"]``, ``feat["station"]``,
-  ``feat["vc_length"]``, etc. as raw strings; the same names are
-  declared inside ``layers.py``'s ``QgsField`` definitions. Centralising
-  them in `constants.py` (or a new `field_names.py`) would let both
-  the producers and consumers share one source of truth. Skipped —
-  only ~10 strings used at one read site each, churn outweighs the
-  win until a field name actually changes.
-
-- **`_safe_float` / `_optional_float` to a shared utils module.**
-  These tiny coercion helpers in `profile_dock.py` would fit naturally
-  in a `plugin/_utils.py`. Skipped — no other module currently needs
-  them, and introducing a utils module just for two functions invites
-  bloat. Promote if a second caller appears.
 
 - **`_KIND_COLORS` to `styling.py`.** Segment-kind palette
   (line/curve/spiral) is hard-coded inside the dock; `styling.py` owns

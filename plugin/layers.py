@@ -27,7 +27,21 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from .constants import PROP_CRS, PROP_SOURCE_PATH, SOURCE_FILE_FIELD
+from .constants import (
+    FIELD_ALIGNMENT,
+    FIELD_CURVATURE_END,
+    FIELD_CURVATURE_START,
+    FIELD_ELEVATION,
+    FIELD_KIND,
+    FIELD_RADIUS_START,
+    FIELD_STA_END,
+    FIELD_STA_START,
+    FIELD_STATION,
+    FIELD_VC_LENGTH,
+    PROP_CRS,
+    PROP_SOURCE_PATH,
+    SOURCE_FILE_FIELD,
+)
 from .dimensions import build_dimensions
 from .geometry_builder import (
     ArcPiece,
@@ -229,7 +243,7 @@ def build_alignment_layer(
         feat.setAttribute("name", alignment.name)
         feat.setAttribute("length_xml", alignment.length)
         feat.setAttribute("length_geom", geom.length())
-        feat.setAttribute("sta_start", alignment.sta_start)
+        feat.setAttribute(FIELD_STA_START, alignment.sta_start)
         feat.setAttribute("n_segments", len(alignment.segments))
         feat.setAttribute(SOURCE_FILE_FIELD, source_file)
         feat.setAttribute("source_path", source_path)
@@ -249,7 +263,7 @@ def alignment_fields() -> list[QgsField]:
         QgsField("name", QMetaType.Type.QString),
         QgsField("length_xml", QMetaType.Type.Double),
         QgsField("length_geom", QMetaType.Type.Double),
-        QgsField("sta_start", QMetaType.Type.Double),
+        QgsField(FIELD_STA_START, QMetaType.Type.Double),
         QgsField("n_segments", QMetaType.Type.Int),
         QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
         QgsField("source_path", QMetaType.Type.QString),
@@ -262,18 +276,18 @@ def alignment_fields() -> list[QgsField]:
 
 def segment_fields() -> list[QgsField]:
     return [
-        QgsField("alignment", QMetaType.Type.QString),
+        QgsField(FIELD_ALIGNMENT, QMetaType.Type.QString),
         QgsField("seg_index", QMetaType.Type.Int),
-        QgsField("kind", QMetaType.Type.QString),
+        QgsField(FIELD_KIND, QMetaType.Type.QString),
         QgsField("transition_type", QMetaType.Type.QString),
         QgsField("length", QMetaType.Type.Double),
-        QgsField("radius_start", QMetaType.Type.Double),
+        QgsField(FIELD_RADIUS_START, QMetaType.Type.Double),
         QgsField("radius_end", QMetaType.Type.Double),
-        QgsField("curvature_start", QMetaType.Type.Double),
-        QgsField("curvature_end", QMetaType.Type.Double),
+        QgsField(FIELD_CURVATURE_START, QMetaType.Type.Double),
+        QgsField(FIELD_CURVATURE_END, QMetaType.Type.Double),
         QgsField("spiral_a", QMetaType.Type.Double),
-        QgsField("sta_start", QMetaType.Type.Double),
-        QgsField("sta_end", QMetaType.Type.Double),
+        QgsField(FIELD_STA_START, QMetaType.Type.Double),
+        QgsField(FIELD_STA_END, QMetaType.Type.Double),
         QgsField("rot", QMetaType.Type.QString),
         QgsField("desc", QMetaType.Type.QString),
         QgsField("status", QMetaType.Type.QString),
@@ -367,18 +381,18 @@ def build_segment_layer(
 
             feat = QgsFeature(layer.fields())
             feat.setGeometry(geom)
-            feat.setAttribute("alignment", alignment.name)
+            feat.setAttribute(FIELD_ALIGNMENT, alignment.name)
             feat.setAttribute("seg_index", idx)
-            feat.setAttribute("kind", seg.kind)
+            feat.setAttribute(FIELD_KIND, seg.kind)
             feat.setAttribute("transition_type", transition_type)
             feat.setAttribute("length", length)
-            feat.setAttribute("radius_start", radius_start)
+            feat.setAttribute(FIELD_RADIUS_START, radius_start)
             feat.setAttribute("radius_end", radius_end)
-            feat.setAttribute("curvature_start", k_start)
-            feat.setAttribute("curvature_end", k_end)
+            feat.setAttribute(FIELD_CURVATURE_START, k_start)
+            feat.setAttribute(FIELD_CURVATURE_END, k_end)
             feat.setAttribute("spiral_a", spiral_a)
-            feat.setAttribute("sta_start", sta)
-            feat.setAttribute("sta_end", sta + length)
+            feat.setAttribute(FIELD_STA_START, sta)
+            feat.setAttribute(FIELD_STA_END, sta + length)
             feat.setAttribute("rot", rot)
             feat.setAttribute("desc", getattr(seg, "desc", None) or "")
             feat.setAttribute("status", getattr(seg, "status", "") or "")
@@ -393,8 +407,8 @@ def build_segment_layer(
 
 def stations_fields() -> list[QgsField]:
     return [
-        QgsField("alignment", QMetaType.Type.QString),
-        QgsField("station", QMetaType.Type.Double),
+        QgsField(FIELD_ALIGNMENT, QMetaType.Type.QString),
+        QgsField(FIELD_STATION, QMetaType.Type.Double),
         QgsField("station_internal", QMetaType.Type.Double),
         QgsField("label", QMetaType.Type.QString),
         QgsField("rotation", QMetaType.Type.Double),
@@ -444,8 +458,8 @@ def build_stations_layer(
                 feat.setGeometry(QgsGeometry(QgsPoint(cp.x, cp.y, z)))
             else:
                 feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
-            feat.setAttribute("alignment", alignment.name)
-            feat.setAttribute("station", cp.station)
+            feat.setAttribute(FIELD_ALIGNMENT, alignment.name)
+            feat.setAttribute(FIELD_STATION, cp.station)
             feat.setAttribute("station_internal", cp.station_internal)
             feat.setAttribute("label", format_station(cp.station))
             # QGIS rotation is CW in screen space; our bearing is math CCW
@@ -505,8 +519,8 @@ def build_chainage_label_layer(
                 feat.setGeometry(QgsGeometry(QgsPoint(cp.x, cp.y, z)))
             else:
                 feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(cp.x, cp.y)))
-            feat.setAttribute("alignment", alignment.name)
-            feat.setAttribute("station", cp.station)
+            feat.setAttribute(FIELD_ALIGNMENT, alignment.name)
+            feat.setAttribute(FIELD_STATION, cp.station)
             feat.setAttribute("station_internal", cp.station_internal)
             feat.setAttribute("label", format_station(cp.station))
             feat.setAttribute(
@@ -537,9 +551,9 @@ build_chainage_layer = build_chainage_label_layer
 
 def dimension_fields() -> list[QgsField]:
     return [
-        QgsField("alignment", QMetaType.Type.QString),
+        QgsField(FIELD_ALIGNMENT, QMetaType.Type.QString),
         QgsField("seg_index", QMetaType.Type.Int),
-        QgsField("kind", QMetaType.Type.QString),
+        QgsField(FIELD_KIND, QMetaType.Type.QString),
         QgsField("label", QMetaType.Type.QString),
         QgsField("rotation", QMetaType.Type.Double),
         QgsField("radius", QMetaType.Type.Double),
@@ -571,9 +585,9 @@ def build_dimension_layer(
         ):
             feat = QgsFeature(layer.fields())
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(d.x, d.y)))
-            feat.setAttribute("alignment", d.alignment)
+            feat.setAttribute(FIELD_ALIGNMENT, d.alignment)
             feat.setAttribute("seg_index", d.seg_index)
-            feat.setAttribute("kind", d.seg_kind)
+            feat.setAttribute(FIELD_KIND, d.seg_kind)
             feat.setAttribute("label", d.label)
             feat.setAttribute(
                 "rotation", upright_bearing(-(d.bearing_deg + label_offset))
@@ -591,12 +605,12 @@ def build_dimension_layer(
 
 def vertical_profile_fields() -> list[QgsField]:
     return [
-        QgsField("alignment", QMetaType.Type.QString),
+        QgsField(FIELD_ALIGNMENT, QMetaType.Type.QString),
         QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
-        QgsField("station", QMetaType.Type.Double),
-        QgsField("elevation", QMetaType.Type.Double),
-        QgsField("vc_length", QMetaType.Type.Double),
-        QgsField("kind", QMetaType.Type.QString),
+        QgsField(FIELD_STATION, QMetaType.Type.Double),
+        QgsField(FIELD_ELEVATION, QMetaType.Type.Double),
+        QgsField(FIELD_VC_LENGTH, QMetaType.Type.Double),
+        QgsField(FIELD_KIND, QMetaType.Type.QString),
     ]
 
 
@@ -626,13 +640,13 @@ def build_vertical_profile_layer(
                     continue
                 feat = QgsFeature(layer.fields())
                 feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(*xy)))
-                feat.setAttribute("alignment", alignment.name)
+                feat.setAttribute(FIELD_ALIGNMENT, alignment.name)
                 feat.setAttribute(SOURCE_FILE_FIELD, source_file)
-                feat.setAttribute("station", item.station)
-                feat.setAttribute("elevation", item.elev)
+                feat.setAttribute(FIELD_STATION, item.station)
+                feat.setAttribute(FIELD_ELEVATION, item.elev)
                 vc_len = getattr(item, "length", 0.0) if isinstance(item, VertCurve) else 0.0
-                feat.setAttribute("vc_length", float(vc_len or 0.0))
-                feat.setAttribute("kind", item.kind)
+                feat.setAttribute(FIELD_VC_LENGTH, float(vc_len or 0.0))
+                feat.setAttribute(FIELD_KIND, item.kind)
                 features.append(feat)
     layer.dataProvider().addFeatures(features)
     layer.updateExtents()
@@ -641,11 +655,11 @@ def build_vertical_profile_layer(
 
 def cross_sections_fields() -> list[QgsField]:
     return [
-        QgsField("alignment", QMetaType.Type.QString),
+        QgsField(FIELD_ALIGNMENT, QMetaType.Type.QString),
         QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
-        QgsField("station", QMetaType.Type.Double),
+        QgsField(FIELD_STATION, QMetaType.Type.Double),
         QgsField("offset", QMetaType.Type.Double),
-        QgsField("elevation", QMetaType.Type.Double),
+        QgsField(FIELD_ELEVATION, QMetaType.Type.Double),
     ]
 
 
@@ -683,11 +697,11 @@ def build_cross_sections_layer(
             feat.setGeometry(QgsGeometry(QgsPoint(xy[0], xy[1], float(cs.elevation))))
         else:
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(*xy)))
-        feat.setAttribute("alignment", cs.alignment_name)
+        feat.setAttribute(FIELD_ALIGNMENT, cs.alignment_name)
         feat.setAttribute(SOURCE_FILE_FIELD, source_file)
-        feat.setAttribute("station", cs.station)
+        feat.setAttribute(FIELD_STATION, cs.station)
         feat.setAttribute("offset", cs.offset)
-        feat.setAttribute("elevation", cs.elevation)
+        feat.setAttribute(FIELD_ELEVATION, cs.elevation)
         features.append(feat)
     layer.dataProvider().addFeatures(features)
     layer.updateExtents()
@@ -749,8 +763,8 @@ def build_cg_points_layer(
 
 def cross_section_surface_fields() -> list[QgsField]:
     return [
-        QgsField("alignment", QMetaType.Type.QString),
-        QgsField("station", QMetaType.Type.Double),
+        QgsField(FIELD_ALIGNMENT, QMetaType.Type.QString),
+        QgsField(FIELD_STATION, QMetaType.Type.Double),
         QgsField("surf_name", QMetaType.Type.QString),
         QgsField("desc", QMetaType.Type.QString),
         QgsField(SOURCE_FILE_FIELD, QMetaType.Type.QString),
@@ -805,8 +819,8 @@ def build_cross_section_surfaces_layer(
             continue
         feat = QgsFeature(layer.fields())
         feat.setGeometry(QgsGeometry(mls.clone()))
-        feat.setAttribute("alignment", surf.alignment_name)
-        feat.setAttribute("station", surf.station)
+        feat.setAttribute(FIELD_ALIGNMENT, surf.alignment_name)
+        feat.setAttribute(FIELD_STATION, surf.station)
         feat.setAttribute("surf_name", surf.name)
         feat.setAttribute("desc", surf.desc)
         feat.setAttribute(SOURCE_FILE_FIELD, source_file)

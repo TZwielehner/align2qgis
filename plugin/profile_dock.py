@@ -33,7 +33,20 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsVectorLayer
 
+from ._utils import optional_float as _optional_float, safe_float as _safe_float
 from .alignment_cache import alignments_by_name
+from .constants import (
+    FIELD_ALIGNMENT,
+    FIELD_CURVATURE_END,
+    FIELD_CURVATURE_START,
+    FIELD_ELEVATION,
+    FIELD_KIND,
+    FIELD_RADIUS_START,
+    FIELD_STA_END,
+    FIELD_STA_START,
+    FIELD_STATION,
+    FIELD_VC_LENGTH,
+)
 from .landxml_parser import (
     PVI,
     ProfAlign,
@@ -102,24 +115,6 @@ _KIND_COLORS = {
     "curve": "#c14040",
     "spiral": "#3a8fc1",
 }
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _optional_float(value) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _high_low_point(
@@ -272,15 +267,15 @@ class Align2QgisProfileDock(QDockWidget):
         if segments_layer is not None and segments_layer.isValid():
             for feat in segments_layer.getFeatures():
                 try:
-                    if alignment_name and str(feat["alignment"]) != alignment_name:
+                    if alignment_name and str(feat[FIELD_ALIGNMENT]) != alignment_name:
                         continue
                     seg = _Segment(
-                        kind=str(feat["kind"]),
-                        sta_start=_safe_float(feat["sta_start"]),
-                        sta_end=_safe_float(feat["sta_end"]),
-                        curvature_start=_safe_float(feat["curvature_start"]),
-                        curvature_end=_safe_float(feat["curvature_end"]),
-                        radius_start=_optional_float(feat["radius_start"]),
+                        kind=str(feat[FIELD_KIND]),
+                        sta_start=_safe_float(feat[FIELD_STA_START]),
+                        sta_end=_safe_float(feat[FIELD_STA_END]),
+                        curvature_start=_safe_float(feat[FIELD_CURVATURE_START]),
+                        curvature_end=_safe_float(feat[FIELD_CURVATURE_END]),
+                        radius_start=_optional_float(feat[FIELD_RADIUS_START]),
                     )
                 except KeyError:
                     continue
@@ -321,12 +316,12 @@ class Align2QgisProfileDock(QDockWidget):
         items: list[PVI | VertCurve] = []
         for feat in layer.getFeatures():
             try:
-                if alignment_name and str(feat["alignment"]) != alignment_name:
+                if alignment_name and str(feat[FIELD_ALIGNMENT]) != alignment_name:
                     continue
-                sta = _safe_float(feat["station"])
-                elev = _safe_float(feat["elevation"])
-                vc_len = _safe_float(feat["vc_length"])
-                kind = str(feat["kind"] or "pvi")
+                sta = _safe_float(feat[FIELD_STATION])
+                elev = _safe_float(feat[FIELD_ELEVATION])
+                vc_len = _safe_float(feat[FIELD_VC_LENGTH])
+                kind = str(feat[FIELD_KIND] or "pvi")
             except KeyError:
                 continue
             if kind == "pvi" or vc_len <= 0:

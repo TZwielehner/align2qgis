@@ -8,7 +8,7 @@ from __future__ import annotations
 import bisect
 import math
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from .landxml_parser import (
     Alignment,
@@ -16,7 +16,6 @@ from .landxml_parser import (
     LineSeg,
     Segment,
     SpiralSeg,
-    StaEquation,
 )
 
 
@@ -828,6 +827,28 @@ class ProjectionResult:
     foot_y: float
 
 
+class ProjectionStep(NamedTuple):
+    """One segment's closest-point result, before alignment-level station math.
+
+    Returned by each ``_project_to_*`` helper and consumed only by
+    :func:`alignment_project_point`, which picks the smallest-``residual``
+    step and converts ``s_local`` into the displayed/internal stations of
+    the final :class:`ProjectionResult`. ``offset_signed`` is left-positive
+    of the forward direction; ``(foot_x, foot_y)`` is the foot of the
+    perpendicular on the segment.
+
+    A :class:`~typing.NamedTuple` rather than a dataclass so the helpers'
+    field names self-document the consumer while the value still unpacks as
+    the ordered 5-tuple the projection tests assert against.
+    """
+
+    s_local: float
+    offset_signed: float
+    foot_x: float
+    foot_y: float
+    residual: float
+
+
 def _signed_left_offset(
     px: float, py: float, fx: float, fy: float, tx: float, ty: float,
 ) -> float:
@@ -841,14 +862,14 @@ def _signed_left_offset(
 
 def _project_to_line_piece(
     piece: LinePiece, px: float, py: float,
-) -> tuple[float, float, float, float, float]:
-    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a line piece."""
+) -> ProjectionStep:
+    """Closest point on a line piece."""
     sx, sy = piece.start
     ex, ey = piece.end
     dx, dy = ex - sx, ey - sy
     L = math.hypot(dx, dy)
     if L < 1e-12:
-        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+        return ProjectionStep(0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
     tx, ty = dx / L, dy / L
     s = (px - sx) * tx + (py - sy) * ty
     s_clamped = max(0.0, min(L, s))
@@ -856,17 +877,17 @@ def _project_to_line_piece(
     fy = sy + s_clamped * ty
     offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
-    return (s_clamped, offset_signed, fx, fy, residual)
+    return ProjectionStep(s_clamped, offset_signed, fx, fy, residual)
 
 
 def _project_to_curve_seg(
     seg: CurveSeg, px: float, py: float,
-) -> tuple[float, float, float, float, float]:
-    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a circular arc."""
+) -> ProjectionStep:
+    """Closest point on a circular arc."""
     cx, cy, r, a0, dtheta, L = _arc_geometry(seg)
     if L <= 0 or r <= 0:
         sx, sy = ne_to_xy(seg.start)
-        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+        return ProjectionStep(0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
     abs_sweep = abs(dtheta)
     sign = 1.0 if dtheta >= 0 else -1.0
     a_p = math.atan2(py - cy, px - cx)
@@ -894,13 +915,13 @@ def _project_to_curve_seg(
         tx, ty = rad_y, -rad_x
     offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
-    return (s_local, offset_signed, fx, fy, residual)
+    return ProjectionStep(s_local, offset_signed, fx, fy, residual)
 
 
 def _project_to_spiral_seg(
     seg: SpiralSeg, px: float, py: float, n_sweep: int = 24,
-) -> tuple[float, float, float, float, float]:
-    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a clothoid.
+) -> ProjectionStep:
+    """Closest point on a clothoid.
 
     No closed-form inversion exists for the Fresnel integrals; we coarse-
     sweep ``n_sweep`` candidates over ``[0, L]`` to seed a golden-section
@@ -910,7 +931,7 @@ def _project_to_spiral_seg(
     L = seg.length
     if L <= 0:
         sx, sy = ne_to_xy(seg.start)
-        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+        return ProjectionStep(0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
     setup = _spiral_setup(seg)
 
     def dist_sq(s: float) -> float:
@@ -949,7 +970,7 @@ def _project_to_spiral_seg(
     tx, ty = math.cos(bearing), math.sin(bearing)
     offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
-    return (s_opt, offset_signed, fx, fy, residual)
+    return ProjectionStep(s_opt, offset_signed, fx, fy, residual)
 
 
 def alignment_project_point(
@@ -974,26 +995,26 @@ def alignment_project_point(
             sx, sy = ne_to_xy(seg.start)
             ex, ey = ne_to_xy(seg.end)
             piece = LinePiece((sx, sy), (ex, ey))
-            s_local, off, fx, fy, res = _project_to_line_piece(piece, px, py)
+            step = _project_to_line_piece(piece, px, py)
         elif isinstance(seg, CurveSeg):
-            s_local, off, fx, fy, res = _project_to_curve_seg(seg, px, py)
+            step = _project_to_curve_seg(seg, px, py)
         elif isinstance(seg, SpiralSeg):
-            s_local, off, fx, fy, res = _project_to_spiral_seg(seg, px, py)
+            step = _project_to_spiral_seg(seg, px, py)
         else:
             cum += L
             continue
-        if res < best_residual:
-            best_residual = res
-            station_internal = cum + s_local
+        if step.residual < best_residual:
+            best_residual = step.residual
+            station_internal = cum + step.s_local
             station_display = internal_to_display(alignment, station_internal)
             best = ProjectionResult(
                 station_display=station_display,
                 station_internal=station_internal,
-                offset_signed=off,
-                residual=res,
+                offset_signed=step.offset_signed,
+                residual=step.residual,
                 seg_index=idx,
-                foot_x=fx,
-                foot_y=fy,
+                foot_x=step.foot_x,
+                foot_y=step.foot_y,
             )
         cum += L
     return best

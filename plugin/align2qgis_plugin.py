@@ -545,86 +545,84 @@ class Align2QgisPlugin:
     ) -> list[tuple[QgsVectorLayer, str, str, bool]]:
         """Return ``[(layer, canonical_name, kind, persist_to_gpkg), …]``.
 
-        ``persist_to_gpkg`` is False for the auxiliary in-memory chainage
-        label layer; everything else gets written to the GeoPackage.
+        Every emitted layer is persisted to the GeoPackage; the optional
+        Segments / Stations / Chainage / Dimensions layers are only included
+        when they came out non-empty (see :func:`add`).
         """
         alignments = parsed.alignments
         meta = parsed.meta
         crs = opts.crs_authid
         tag = lambda layer: tag_layer(layer, opts.landxml_path, crs)  # noqa: E731
 
-        out: list[tuple[QgsVectorLayer, str, str, bool]] = [(
-            tag(build_alignment_layer(
-                alignments, ALIGNMENT_LAYER_PREFIX, crs,
-                source_file=base, source_path=opts.landxml_path,
-                imported_at=imported_at, metadata=meta,
-            )),
-            ALIGNMENT_LAYER_PREFIX,
-            _KIND_ALIGNMENT,
-            True,
-        )]
+        out: list[tuple[QgsVectorLayer, str, str, bool]] = []
 
-        seg_layer = tag(build_segment_layer(
+        def add(layer: QgsVectorLayer, name: str, kind: str, *,
+                require_features: bool = False) -> None:
+            """Tag and enqueue ``layer`` for registration / GeoPackage write.
+
+            ``require_features=True`` drops layers that came out empty (the
+            optional Segments / Stations / Chainage / Dimensions outputs);
+            always-present tables (Alignments, VerticalProfile, CrossSections)
+            are kept even when empty so their schema lands in the GeoPackage.
+            """
+            if require_features and layer.featureCount() == 0:
+                return
+            out.append((tag(layer), name, kind, True))
+
+        add(build_alignment_layer(
+            alignments, ALIGNMENT_LAYER_PREFIX, crs,
+            source_file=base, source_path=opts.landxml_path,
+            imported_at=imported_at, metadata=meta,
+        ), ALIGNMENT_LAYER_PREFIX, _KIND_ALIGNMENT)
+
+        add(build_segment_layer(
             alignments, SEGMENTS_LAYER_PREFIX, crs, source_file=base,
-        ))
-        if seg_layer.featureCount() > 0:
-            out.append((seg_layer, SEGMENTS_LAYER_PREFIX, _KIND_SEGMENTS, True))
+        ), SEGMENTS_LAYER_PREFIX, _KIND_SEGMENTS, require_features=True)
 
         # Stations table = defining stations only (segment endpoints + start).
-        stn_layer = tag(build_stations_layer(
+        add(build_stations_layer(
             alignments, STATIONS_LAYER_PREFIX, crs,
             perpendicular=opts.label_perpendicular,
             source_file=base,
-        ))
-        if stn_layer.featureCount() > 0:
-            out.append((stn_layer, STATIONS_LAYER_PREFIX, _KIND_STATIONS, True))
+        ), STATIONS_LAYER_PREFIX, _KIND_STATIONS, require_features=True)
 
-        # Interval chainage labels live on a separate in-memory point layer.
+        # Interval chainage labels live on a separate point layer.
         if opts.chainage_interval > 0:
-            chain_layer = tag(build_chainage_label_layer(
+            add(build_chainage_label_layer(
                 alignments, CHAINAGE_LABEL_LAYER, crs, opts.chainage_interval,
                 perpendicular=opts.label_perpendicular,
-            ))
-            if chain_layer.featureCount() > 0:
-                out.append((chain_layer, CHAINAGE_LABEL_LAYER, _KIND_CHAINAGE, True))
+            ), CHAINAGE_LABEL_LAYER, _KIND_CHAINAGE, require_features=True)
 
         if opts.create_dimension_layer and (
             opts.dim_arcs or opts.dim_spirals or opts.dim_tangents
         ):
-            dim_layer = tag(build_dimension_layer(
+            add(build_dimension_layer(
                 alignments, DIMENSIONS_LAYER_PREFIX, crs,
                 arcs=opts.dim_arcs, spirals=opts.dim_spirals, tangents=opts.dim_tangents,
                 perpendicular=opts.label_perpendicular,
                 source_file=base,
-            ))
-            if dim_layer.featureCount() > 0:
-                out.append((dim_layer, DIMENSIONS_LAYER_PREFIX, _KIND_DIMENSIONS, True))
+            ), DIMENSIONS_LAYER_PREFIX, _KIND_DIMENSIONS, require_features=True)
 
         # Always persist VerticalProfile and CrossSections (may be empty layers).
-        vp_layer = tag(build_vertical_profile_layer(
+        add(build_vertical_profile_layer(
             alignments, VERTICAL_PROFILE_LAYER, crs, source_file=base,
-        ))
-        out.append((vp_layer, VERTICAL_PROFILE_LAYER, _KIND_VERTICAL_PROFILE, True))
+        ), VERTICAL_PROFILE_LAYER, _KIND_VERTICAL_PROFILE)
 
-        xs_layer = tag(build_cross_sections_layer(
+        add(build_cross_sections_layer(
             parsed.cross_sections, alignments,
             CROSS_SECTIONS_LAYER, crs, source_file=base,
-        ))
-        out.append((xs_layer, CROSS_SECTIONS_LAYER, _KIND_CROSS_SECTIONS, True))
+        ), CROSS_SECTIONS_LAYER, _KIND_CROSS_SECTIONS)
 
         if parsed.cross_section_surfaces:
-            xss_layer = tag(build_cross_section_surfaces_layer(
+            add(build_cross_section_surfaces_layer(
                 parsed.cross_section_surfaces, alignments,
                 CROSS_SECTION_SURFACES_LAYER, crs, source_file=base,
-            ))
-            out.append((xss_layer, CROSS_SECTION_SURFACES_LAYER,
-                        _KIND_CROSS_SECTION_SURFACES, True))
+            ), CROSS_SECTION_SURFACES_LAYER, _KIND_CROSS_SECTION_SURFACES)
 
         if parsed.cg_points:
-            cg_layer = tag(build_cg_points_layer(
+            add(build_cg_points_layer(
                 parsed.cg_points, CG_POINTS_LAYER, crs, source_file=base,
-            ))
-            out.append((cg_layer, CG_POINTS_LAYER, _KIND_CG_POINTS, True))
+            ), CG_POINTS_LAYER, _KIND_CG_POINTS)
 
         return out
 
