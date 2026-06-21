@@ -20,7 +20,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from plugin.geometry_builder import (  # noqa: E402
-    ArcPiece,
     LinePiece,
     alignment_curve_pieces,
     alignment_curve_pieces_3d,

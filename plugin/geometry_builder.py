@@ -8,7 +8,7 @@ from __future__ import annotations
 import bisect
 import math
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from .landxml_parser import (
     Alignment,
@@ -16,7 +16,6 @@ from .landxml_parser import (
     LineSeg,
     Segment,
     SpiralSeg,
-    StaEquation,
 )
 
 
@@ -481,41 +480,110 @@ def _arc_pose(setup: tuple[float, float, float, float, float, float], s: float) 
     return (x, y, bearing)
 
 
+_SPIRAL_SETUP_CACHE_ATTR = "_align2qgis_spiral_setup_cache"
+_SPIRAL_TABLE_CACHE_ATTR = "_align2qgis_spiral_table_cache"
+
+# Local cumulative-integration grid density (nodes per metre). Matches the
+# ~2 m step the per-call integrator used before, so cached poses stay within
+# the projection tests' sub-millimetre budget.
+_SPIRAL_TABLE_NODES_PER_M = 0.5
+_SPIRAL_TABLE_MIN_NODES = 16
+
+
 def _spiral_setup(seg: SpiralSeg) -> tuple[float, float, float, float, float, float]:
     """``(sx, sy, cos_a, sin_a, k0, k1)`` — world placement + curvature endpoints.
 
     Thin wrapper around :func:`_spiral_placement` that drops the local
     integration buffer (the chainage walker re-samples per station via
     :func:`_spiral_pose`).
+
+    Cached on the segment so a projection batch — which re-derives the same
+    placement once per input point — pays the rot-disambiguation integration
+    only once. Keyed on a snapshot of the placement-determining fields
+    (``start`` / ``end`` / ``pi`` are mutated in place by reprojection, so an
+    identity key alone would go stale); a changed field rebuilds.
     """
+    key = (seg.start, seg.end, seg.pi, seg.length,
+           seg.radius_start, seg.radius_end, seg.rot)
+    cached = getattr(seg, _SPIRAL_SETUP_CACHE_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
     n = max(16, int(math.ceil(seg.length * 0.5)))
     sx, sy, cos_a, sin_a, k0, k1, _ = _spiral_placement(seg, n)
-    return (sx, sy, cos_a, sin_a, k0, k1)
+    setup = (sx, sy, cos_a, sin_a, k0, k1)
+    try:
+        object.__setattr__(seg, _SPIRAL_SETUP_CACHE_ATTR, (key, setup))
+    except (AttributeError, TypeError):
+        pass
+    return setup
+
+
+def _spiral_local_table(
+    seg: SpiralSeg, k0: float, k1: float, L: float,
+) -> tuple[float, list[float], list[float]]:
+    """``(h, lxs, lys)`` — cumulative local clothoid integral on a uniform grid.
+
+    ``lxs[i]`` / ``lys[i]`` are the trapezoidal integral of ``(cosθ, sinθ)``
+    from 0 to ``i·h`` in the spiral's local frame (start at origin, initial
+    tangent +x). :func:`_spiral_pose` reads these and adds one exact partial
+    trapezoid step to reach an arbitrary ``s`` in O(1), instead of
+    re-integrating from 0 on every call.
+
+    The table depends only on ``(L, k0, k1)`` — all reprojection-invariant —
+    so it survives the in-place endpoint mutation that setup does not, but is
+    keyed on those values anyway for robustness.
+    """
+    key = (L, k0, k1)
+    cached = getattr(seg, _SPIRAL_TABLE_CACHE_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    m = max(_SPIRAL_TABLE_MIN_NODES, int(math.ceil(L * _SPIRAL_TABLE_NODES_PER_M)))
+    h = L / m
+    lxs = [0.0]
+    lys = [0.0]
+    lx = ly = 0.0
+    cos_prev, sin_prev = 1.0, 0.0
+    for i in range(1, m + 1):
+        s_i = i * h
+        theta = k0 * s_i + (k1 - k0) * s_i * s_i / (2.0 * L)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        lx += 0.5 * (cos_prev + cos_t) * h
+        ly += 0.5 * (sin_prev + sin_t) * h
+        lxs.append(lx)
+        lys.append(ly)
+        cos_prev, sin_prev = cos_t, sin_t
+    table = (h, lxs, lys)
+    try:
+        object.__setattr__(seg, _SPIRAL_TABLE_CACHE_ATTR, (key, table))
+    except (AttributeError, TypeError):
+        pass
+    return table
 
 
 def _spiral_pose(seg: SpiralSeg, setup: tuple, s: float) -> tuple[float, float, float]:
+    """``(x, y, bearing_deg)`` at arclength ``s`` along the spiral.
+
+    Reuses the cached cumulative integral from :func:`_spiral_local_table`
+    (nearest grid node ≤ ``s``) plus a single exact trapezoid step to ``s``,
+    then maps the local point into world coords via ``setup``'s rotation.
+    """
     sx, sy, cos_a, sin_a, k0, k1 = setup
     L = seg.length
     s = max(0.0, min(L, s))
     rot_angle = math.atan2(sin_a, cos_a)
+    theta_s = k0 * s + (k1 - k0) * s * s / (2.0 * L)
     if s <= 0.0:
         return (sx, sy, math.degrees(rot_angle))
-    n = max(2, int(math.ceil(s * 0.5)))
-    ds = s / n
-    lx = ly = 0.0
-    cos_prev, sin_prev = 1.0, 0.0
-    theta = 0.0
-    for i in range(1, n + 1):
-        t_s = i * ds
-        theta = k0 * t_s + (k1 - k0) * t_s * t_s / (2.0 * L)
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-        lx += 0.5 * (cos_prev + cos_t) * ds
-        ly += 0.5 * (sin_prev + sin_t) * ds
-        cos_prev, sin_prev = cos_t, sin_t
+    h, lxs, lys = _spiral_local_table(seg, k0, k1, L)
+    k = min(int(s / h), len(lxs) - 1)
+    s_k = k * h
+    theta_k = k0 * s_k + (k1 - k0) * s_k * s_k / (2.0 * L)
+    lx = lxs[k] + 0.5 * (math.cos(theta_k) + math.cos(theta_s)) * (s - s_k)
+    ly = lys[k] + 0.5 * (math.sin(theta_k) + math.sin(theta_s)) * (s - s_k)
     wx = sx + cos_a * lx - sin_a * ly
     wy = sy + sin_a * lx + cos_a * ly
-    return (wx, wy, math.degrees(rot_angle + theta))
+    return (wx, wy, math.degrees(rot_angle + theta_s))
 
 
 def segment_curvature(seg: Segment) -> tuple[float, float]:
@@ -828,6 +896,28 @@ class ProjectionResult:
     foot_y: float
 
 
+class ProjectionStep(NamedTuple):
+    """One segment's closest-point result, before alignment-level station math.
+
+    Returned by each ``_project_to_*`` helper and consumed only by
+    :func:`alignment_project_point`, which picks the smallest-``residual``
+    step and converts ``s_local`` into the displayed/internal stations of
+    the final :class:`ProjectionResult`. ``offset_signed`` is left-positive
+    of the forward direction; ``(foot_x, foot_y)`` is the foot of the
+    perpendicular on the segment.
+
+    A :class:`~typing.NamedTuple` rather than a dataclass so the helpers'
+    field names self-document the consumer while the value still unpacks as
+    the ordered 5-tuple the projection tests assert against.
+    """
+
+    s_local: float
+    offset_signed: float
+    foot_x: float
+    foot_y: float
+    residual: float
+
+
 def _signed_left_offset(
     px: float, py: float, fx: float, fy: float, tx: float, ty: float,
 ) -> float:
@@ -841,14 +931,14 @@ def _signed_left_offset(
 
 def _project_to_line_piece(
     piece: LinePiece, px: float, py: float,
-) -> tuple[float, float, float, float, float]:
-    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a line piece."""
+) -> ProjectionStep:
+    """Closest point on a line piece."""
     sx, sy = piece.start
     ex, ey = piece.end
     dx, dy = ex - sx, ey - sy
     L = math.hypot(dx, dy)
     if L < 1e-12:
-        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+        return ProjectionStep(0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
     tx, ty = dx / L, dy / L
     s = (px - sx) * tx + (py - sy) * ty
     s_clamped = max(0.0, min(L, s))
@@ -856,17 +946,17 @@ def _project_to_line_piece(
     fy = sy + s_clamped * ty
     offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
-    return (s_clamped, offset_signed, fx, fy, residual)
+    return ProjectionStep(s_clamped, offset_signed, fx, fy, residual)
 
 
 def _project_to_curve_seg(
     seg: CurveSeg, px: float, py: float,
-) -> tuple[float, float, float, float, float]:
-    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a circular arc."""
+) -> ProjectionStep:
+    """Closest point on a circular arc."""
     cx, cy, r, a0, dtheta, L = _arc_geometry(seg)
     if L <= 0 or r <= 0:
         sx, sy = ne_to_xy(seg.start)
-        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+        return ProjectionStep(0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
     abs_sweep = abs(dtheta)
     sign = 1.0 if dtheta >= 0 else -1.0
     a_p = math.atan2(py - cy, px - cx)
@@ -894,13 +984,13 @@ def _project_to_curve_seg(
         tx, ty = rad_y, -rad_x
     offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
-    return (s_local, offset_signed, fx, fy, residual)
+    return ProjectionStep(s_local, offset_signed, fx, fy, residual)
 
 
 def _project_to_spiral_seg(
     seg: SpiralSeg, px: float, py: float, n_sweep: int = 24,
-) -> tuple[float, float, float, float, float]:
-    """``(s_local, signed_offset, foot_x, foot_y, residual)`` for a clothoid.
+) -> ProjectionStep:
+    """Closest point on a clothoid.
 
     No closed-form inversion exists for the Fresnel integrals; we coarse-
     sweep ``n_sweep`` candidates over ``[0, L]`` to seed a golden-section
@@ -910,7 +1000,7 @@ def _project_to_spiral_seg(
     L = seg.length
     if L <= 0:
         sx, sy = ne_to_xy(seg.start)
-        return (0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
+        return ProjectionStep(0.0, 0.0, sx, sy, math.hypot(px - sx, py - sy))
     setup = _spiral_setup(seg)
 
     def dist_sq(s: float) -> float:
@@ -949,7 +1039,7 @@ def _project_to_spiral_seg(
     tx, ty = math.cos(bearing), math.sin(bearing)
     offset_signed = _signed_left_offset(px, py, fx, fy, tx, ty)
     residual = math.hypot(px - fx, py - fy)
-    return (s_opt, offset_signed, fx, fy, residual)
+    return ProjectionStep(s_opt, offset_signed, fx, fy, residual)
 
 
 def alignment_project_point(
@@ -974,26 +1064,26 @@ def alignment_project_point(
             sx, sy = ne_to_xy(seg.start)
             ex, ey = ne_to_xy(seg.end)
             piece = LinePiece((sx, sy), (ex, ey))
-            s_local, off, fx, fy, res = _project_to_line_piece(piece, px, py)
+            step = _project_to_line_piece(piece, px, py)
         elif isinstance(seg, CurveSeg):
-            s_local, off, fx, fy, res = _project_to_curve_seg(seg, px, py)
+            step = _project_to_curve_seg(seg, px, py)
         elif isinstance(seg, SpiralSeg):
-            s_local, off, fx, fy, res = _project_to_spiral_seg(seg, px, py)
+            step = _project_to_spiral_seg(seg, px, py)
         else:
             cum += L
             continue
-        if res < best_residual:
-            best_residual = res
-            station_internal = cum + s_local
+        if step.residual < best_residual:
+            best_residual = step.residual
+            station_internal = cum + step.s_local
             station_display = internal_to_display(alignment, station_internal)
             best = ProjectionResult(
                 station_display=station_display,
                 station_internal=station_internal,
-                offset_signed=off,
-                residual=res,
+                offset_signed=step.offset_signed,
+                residual=step.residual,
                 seg_index=idx,
-                foot_x=fx,
-                foot_y=fy,
+                foot_x=step.foot_x,
+                foot_y=step.foot_y,
             )
         cum += L
     return best

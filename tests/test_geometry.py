@@ -486,7 +486,7 @@ def test_spiral_picks_correct_rot_against_wrong_landxml_attr():
     # Mid-spiral point should land on the CCW-side of the start tangent
     # (positive y in this local frame after the tangent-aligned rotation).
     mid = pts[len(pts) // 2]
-    sx, sy = 2000.0, 1000.0  # in QGIS axes (x=E, y=N)
+    sy = 1000.0  # start N in QGIS axes (x=E, y=N)
     # The start tangent points +x; CCW spiral curves toward +y.
     assert mid[1] > sy + 1e-6
 

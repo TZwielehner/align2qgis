@@ -579,18 +579,11 @@ def profile_samples(
                 out.append((item.station, item.elev))
                 continue
 
-            g_back = (
-                (items[i].elev - items[i - 1].elev)
-                / (items[i].station - items[i - 1].station)
-                if i > 0 and items[i].station > items[i - 1].station
-                else 0.0
-            )
-            g_ahead = (
-                (items[i + 1].elev - items[i].elev)
-                / (items[i + 1].station - items[i].station)
-                if i < n - 1 and items[i + 1].station > items[i].station
-                else 0.0
-            )
+            # Back/ahead tangent grades from the neighbour PVIs — same math
+            # as :func:`profile_elevation_at_station` via :func:`_grade_between`
+            # (which returns 0.0 at the list ends and for coincident stations).
+            g_back = _grade_between(items, i - 1, i) if i > 0 else 0.0
+            g_ahead = _grade_between(items, i, i + 1) if i < n - 1 else 0.0
 
             sta_bvc = item.station - L / 2.0
             elev_bvc = item.elev - (L / 2.0) * g_back
