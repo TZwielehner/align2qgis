@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from plugin.geometry_builder import (  # noqa: E402
     ArcPiece,
+    _arc_geometry,
     LinePiece,
     _locate_walker,
     alignment_chainage,
@@ -20,6 +21,8 @@ from plugin.geometry_builder import (  # noqa: E402
     arc_points,
     line_points,
     segment_curve_pieces,
+    snap_curve_pieces,
+    snap_curve_pieces_with_z,
     spiral_arc_triples,
     spiral_points,
 )
@@ -548,3 +551,105 @@ def test_alignment_curve_pieces_joins_segments():
     assert isinstance(pieces[1], ArcPiece)
     # Line end coincides with arc start (in QGIS axes).
     assert _close(pieces[0].end, pieces[1].start)
+
+
+def test_snap_curve_pieces_closes_float_gaps_exactly():
+    # Two lines whose join differs by float noise — QGIS tolerates it, OGR
+    # rejects the CompoundCurve as "Non contiguous curves".
+    a = LinePiece((0.0, 0.0), (100.0, 0.0))
+    b = LinePiece((100.0 + 1e-9, 1e-9), (200.0, 0.0))
+    snapped, gap = snap_curve_pieces([a, b])
+    assert snapped[0].end == snapped[1].start  # exact equality, not approx
+    assert gap < 1e-3
+    # Untouched pieces keep their original values.
+    assert snapped[0] == a
+    assert snapped[1].end == b.end
+
+
+def test_snap_curve_pieces_reports_real_gap_and_snaps_arcs():
+    line = LinePiece((0.0, 0.0), (100.0, 0.0))
+    arc = ArcPiece((100.0, 0.5), (150.0, 10.0), (200.0, 0.0))
+    snapped, gap = snap_curve_pieces([line, arc])
+    assert snapped[1].start == (100.0, 0.0)
+    assert math.isclose(gap, 0.5)
+    # Only the start moves; midpoint and end are left alone.
+    assert snapped[1].mid == arc.mid
+    assert snapped[1].end == arc.end
+
+
+def test_snap_curve_pieces_with_z_snaps_elevation_too():
+    a = LinePiece((0.0, 0.0), (100.0, 0.0))
+    b = LinePiece((100.0, 0.0), (200.0, 0.0))
+    snapped, gap = snap_curve_pieces_with_z([(a, [10.0, 12.0]), (b, [0.0, 14.0])])
+    # Z=0 fallback at the join is replaced by the previous piece's Z.
+    assert snapped[1][1] == [12.0, 14.0]
+    assert math.isclose(gap, 12.0)
+    assert snapped[0][1] == [10.0, 12.0]
+
+
+def test_snap_curve_pieces_on_empty_and_single_input():
+    assert snap_curve_pieces([]) == ([], 0.0)
+    only = LinePiece((0.0, 0.0), (1.0, 0.0))
+    assert snap_curve_pieces([only]) == ([only], 0.0)
+
+
+def test_sample_alignment_pieces_are_contiguous_after_snapping():
+    a = parse_alignments(SAMPLE_XML.encode("utf-8"))[0]
+    snapped, _ = snap_curve_pieces(alignment_curve_pieces(a))
+    for prev, nxt in zip(snapped, snapped[1:]):
+        assert prev.end == nxt.start
+
+
+def _quarter_arc(rot: str, length: float | None = None) -> CurveSeg:
+    """Quarter circle, r=100: start due east of the centre, end due north.
+
+    In QGIS axes the ccw sweep is +90° (arclength ~157 m) and the cw sweep
+    is the major arc the other way round (~471 m).
+    """
+    return CurveSeg(
+        start=(0.0, 100.0), center=(0.0, 0.0), end=(100.0, 0.0),
+        radius=100.0, rot=rot, length=length,
+    )
+
+
+def test_arc_follows_declared_rot_without_length():
+    _, _, _, _, ccw, len_ccw = _arc_geometry(_quarter_arc("ccw"))
+    assert ccw > 0
+    assert math.isclose(len_ccw, 100.0 * math.pi / 2, rel_tol=1e-9)
+    # A declared cw arc sweeps the major way round — not silently flipped
+    # back to the short arc.
+    _, _, _, _, cw, len_cw = _arc_geometry(_quarter_arc("cw"))
+    assert cw < 0
+    assert math.isclose(len_cw, 100.0 * 3 * math.pi / 2, rel_tol=1e-9)
+
+
+def test_declared_rot_survives_a_rounded_length():
+    # length rounded to full metres must not flip the declaration.
+    seg = _quarter_arc("ccw", length=157.0)
+    _, _, _, _, dtheta, _ = _arc_geometry(seg)
+    assert dtheta > 0
+
+
+def test_length_overrides_rot_only_on_clear_contradiction():
+    # Exporter hard-codes rot="ccw" but states the cw arclength.
+    seg = _quarter_arc("ccw", length=100.0 * 3 * math.pi / 2)
+    _, _, _, _, dtheta, arclen = _arc_geometry(seg)
+    assert dtheta < 0
+    assert math.isclose(arclen, seg.length, rel_tol=1e-9)
+
+
+def test_missing_rot_falls_back_to_length_then_ccw():
+    _, _, _, _, dtheta, _ = _arc_geometry(_quarter_arc("", length=100.0 * 3 * math.pi / 2))
+    assert dtheta < 0
+    # Neither rot nor length: ccw, LandXML's default reading.
+    _, _, _, _, dtheta, _ = _arc_geometry(_quarter_arc(""))
+    assert dtheta > 0
+
+
+def test_curve_without_rot_attribute_parses_as_undeclared():
+    xml = SAMPLE_XML.replace('rot="ccw"', "")
+    seg = next(
+        s for s in parse_alignments(xml.encode("utf-8"))[0].segments
+        if isinstance(s, CurveSeg)
+    )
+    assert seg.rot == ""

@@ -285,7 +285,9 @@ def _parse_curve(elem: ET.Element) -> CurveSeg:
         dn = start[0] - center[0]
         de = start[1] - center[1]
         radius = (dn * dn + de * de) ** 0.5
-    rot = (elem.attrib.get("rot") or "ccw").lower()
+    # Empty (not "ccw") when the attribute is absent, so the geometry
+    # builder can tell "no declaration" from a declared left-hand bend.
+    rot = (elem.attrib.get("rot") or "").lower()
     length_attr = elem.attrib.get("length")
     desc = elem.attrib.get("desc")
     return CurveSeg(

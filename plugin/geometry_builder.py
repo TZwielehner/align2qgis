@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, NamedTuple
 
 from .landxml_parser import (
@@ -37,6 +37,11 @@ def line_points(seg: LineSeg) -> list[XY]:
 # ---------------------------------------------------------------------------
 # Circular arcs
 # ---------------------------------------------------------------------------
+# Relative mismatch between a declared sweep and ``length / r`` above which
+# the declared ``rot`` is treated as wrong rather than as a rounded length.
+_ROT_LENGTH_TOL = 0.02
+
+
 def _arc_geometry(seg: CurveSeg) -> tuple[float, float, float, float, float, float]:
     """Resolve ``(cx, cy, r, a0, dtheta, arclength)`` for ``seg``.
 
@@ -46,8 +51,12 @@ def _arc_geometry(seg: CurveSeg) -> tuple[float, float, float, float, float, flo
     (rendering) and the chainage walker so both paths agree on what is and
     isn't actually swept.
 
-    LandXML ``rot`` (cw/ccw) is unreliable in the wild — when ``length`` is
-    provided we pick whichever of the two candidate sweeps matches it best.
+    The declared ``rot`` (cw/ccw) decides the sweep direction. ``length``
+    is only a tiebreak: it resolves arcs whose ``rot`` attribute is missing,
+    and it overrides a declared ``rot`` when the two candidate sweeps make
+    it unambiguous that the declaration contradicts the stated arclength
+    (some exporters hard-code ``rot="ccw"`` on every curve, which turns
+    every right-hand bend into the major arc the long way round).
     """
     cx, cy = ne_to_xy(seg.center)
     sx, sy = ne_to_xy(seg.start)
@@ -65,11 +74,24 @@ def _arc_geometry(seg: CurveSeg) -> tuple[float, float, float, float, float, flo
         ccw_sweep += 2 * math.pi
     cw_sweep = ccw_sweep - 2 * math.pi  # negative
 
-    if seg.length is not None and seg.length > 0:
-        target = seg.length / r
+    target = seg.length / r if seg.length is not None and seg.length > 0 else None
+    rot = (seg.rot or "").lower()
+    if rot in ("cw", "ccw"):
+        dtheta = cw_sweep if rot == "cw" else ccw_sweep
+        other = ccw_sweep if rot == "cw" else cw_sweep
+        if target is not None:
+            err_decl = abs(abs(dtheta) - target)
+            err_other = abs(abs(other) - target)
+            # Only overrule the declaration when the stated arclength is a
+            # poor fit for it *and* a clearly better fit for the opposite
+            # sweep — never on the sub-percent noise of a rounded length.
+            if err_decl > _ROT_LENGTH_TOL * target and err_other < err_decl:
+                dtheta = other
+    elif target is not None:
         dtheta = ccw_sweep if abs(ccw_sweep - target) <= abs(abs(cw_sweep) - target) else cw_sweep
     else:
-        dtheta = ccw_sweep if seg.rot.lower() != "cw" else cw_sweep
+        # Neither rot nor length: LandXML's own default reading is ccw.
+        dtheta = ccw_sweep
 
     return (cx, cy, r, a0, dtheta, abs(dtheta) * r)
 
@@ -356,14 +378,73 @@ def segment_curve_pieces(
     raise TypeError(f"unknown segment type: {type(seg).__name__}")
 
 
+# Gaps between consecutive pieces above this (metres) are reported by the
+# snapping helpers below. Sub-millimetre mismatches are expected — segment
+# endpoints come from independent LandXML values and from clothoid
+# integration — while anything larger points at a genuinely broken
+# alignment and is worth a console warning.
+SNAP_WARN_TOLERANCE = 1e-3
+
+
+def snap_curve_pieces(pieces: list[CurvePiece]) -> tuple[list[CurvePiece], float]:
+    """Force consecutive pieces to share an exact join point.
+
+    QGIS tolerates a tiny mismatch between one piece's end and the next
+    piece's start, but OGR does not: writing such a CompoundCurve to a
+    GeoPackage fails with "Non contiguous curves" and the feature is
+    dropped. Each piece's start is therefore replaced by the previous
+    piece's end verbatim.
+
+    Returns the snapped pieces plus the largest gap that had to be closed,
+    so callers can warn when the mismatch exceeds
+    :data:`SNAP_WARN_TOLERANCE`.
+    """
+    out: list[CurvePiece] = []
+    max_gap = 0.0
+    prev_end: XY | None = None
+    for piece in pieces:
+        if prev_end is not None and piece.start != prev_end:
+            max_gap = max(max_gap, math.dist(piece.start, prev_end))
+            piece = replace(piece, start=prev_end)
+        out.append(piece)
+        prev_end = piece.end
+    return out, max_gap
+
+
+def snap_curve_pieces_with_z(
+    pieces_with_z: list[tuple[CurvePiece, list[float]]],
+) -> tuple[list[tuple[CurvePiece, list[float]]], float]:
+    """3D counterpart of :func:`snap_curve_pieces`.
+
+    Snaps X, Y *and* Z — OGR compares the full join vertex — and measures
+    the closed gap in 3D.
+    """
+    out: list[tuple[CurvePiece, list[float]]] = []
+    max_gap = 0.0
+    prev_end: XY | None = None
+    prev_z: float | None = None
+    for piece, zs in pieces_with_z:
+        if prev_end is not None and (piece.start != prev_end or zs[0] != prev_z):
+            max_gap = max(max_gap, math.dist(
+                (piece.start[0], piece.start[1], zs[0]),
+                (prev_end[0], prev_end[1], prev_z),
+            ))
+            piece = replace(piece, start=prev_end)
+            zs = [prev_z, *zs[1:]]
+        out.append((piece, zs))
+        prev_end = piece.end
+        prev_z = zs[-1]
+    return out, max_gap
+
+
 def alignment_curve_pieces(
     alignment: Alignment, max_chord_err: float = 0.01,
 ) -> list[CurvePiece]:
     """Concatenate every segment's curve pieces into one ordered list.
 
-    No deduplication between pieces is needed — adjacent segments already
-    share endpoints by construction, and CompoundCurve assembly tolerates
-    coincident join points.
+    Adjacent segments already share their join points by construction, up
+    to float noise; :func:`snap_curve_pieces` closes that residue before
+    the pieces are handed to a CompoundCurve.
     """
     out: list[CurvePiece] = []
     for seg in alignment.segments:
