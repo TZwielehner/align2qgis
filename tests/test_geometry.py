@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from plugin.geometry_builder import (  # noqa: E402
     ArcPiece,
+    _arc_geometry,
     LinePiece,
     _locate_walker,
     alignment_chainage,
@@ -597,3 +598,58 @@ def test_sample_alignment_pieces_are_contiguous_after_snapping():
     snapped, _ = snap_curve_pieces(alignment_curve_pieces(a))
     for prev, nxt in zip(snapped, snapped[1:]):
         assert prev.end == nxt.start
+
+
+def _quarter_arc(rot: str, length: float | None = None) -> CurveSeg:
+    """Quarter circle, r=100: start due east of the centre, end due north.
+
+    In QGIS axes the ccw sweep is +90° (arclength ~157 m) and the cw sweep
+    is the major arc the other way round (~471 m).
+    """
+    return CurveSeg(
+        start=(0.0, 100.0), center=(0.0, 0.0), end=(100.0, 0.0),
+        radius=100.0, rot=rot, length=length,
+    )
+
+
+def test_arc_follows_declared_rot_without_length():
+    _, _, _, _, ccw, len_ccw = _arc_geometry(_quarter_arc("ccw"))
+    assert ccw > 0
+    assert math.isclose(len_ccw, 100.0 * math.pi / 2, rel_tol=1e-9)
+    # A declared cw arc sweeps the major way round — not silently flipped
+    # back to the short arc.
+    _, _, _, _, cw, len_cw = _arc_geometry(_quarter_arc("cw"))
+    assert cw < 0
+    assert math.isclose(len_cw, 100.0 * 3 * math.pi / 2, rel_tol=1e-9)
+
+
+def test_declared_rot_survives_a_rounded_length():
+    # length rounded to full metres must not flip the declaration.
+    seg = _quarter_arc("ccw", length=157.0)
+    _, _, _, _, dtheta, _ = _arc_geometry(seg)
+    assert dtheta > 0
+
+
+def test_length_overrides_rot_only_on_clear_contradiction():
+    # Exporter hard-codes rot="ccw" but states the cw arclength.
+    seg = _quarter_arc("ccw", length=100.0 * 3 * math.pi / 2)
+    _, _, _, _, dtheta, arclen = _arc_geometry(seg)
+    assert dtheta < 0
+    assert math.isclose(arclen, seg.length, rel_tol=1e-9)
+
+
+def test_missing_rot_falls_back_to_length_then_ccw():
+    _, _, _, _, dtheta, _ = _arc_geometry(_quarter_arc("", length=100.0 * 3 * math.pi / 2))
+    assert dtheta < 0
+    # Neither rot nor length: ccw, LandXML's default reading.
+    _, _, _, _, dtheta, _ = _arc_geometry(_quarter_arc(""))
+    assert dtheta > 0
+
+
+def test_curve_without_rot_attribute_parses_as_undeclared():
+    xml = SAMPLE_XML.replace('rot="ccw"', "")
+    seg = next(
+        s for s in parse_alignments(xml.encode("utf-8"))[0].segments
+        if isinstance(s, CurveSeg)
+    )
+    assert seg.rot == ""

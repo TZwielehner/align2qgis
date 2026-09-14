@@ -37,6 +37,11 @@ def line_points(seg: LineSeg) -> list[XY]:
 # ---------------------------------------------------------------------------
 # Circular arcs
 # ---------------------------------------------------------------------------
+# Relative mismatch between a declared sweep and ``length / r`` above which
+# the declared ``rot`` is treated as wrong rather than as a rounded length.
+_ROT_LENGTH_TOL = 0.02
+
+
 def _arc_geometry(seg: CurveSeg) -> tuple[float, float, float, float, float, float]:
     """Resolve ``(cx, cy, r, a0, dtheta, arclength)`` for ``seg``.
 
@@ -46,8 +51,12 @@ def _arc_geometry(seg: CurveSeg) -> tuple[float, float, float, float, float, flo
     (rendering) and the chainage walker so both paths agree on what is and
     isn't actually swept.
 
-    LandXML ``rot`` (cw/ccw) is unreliable in the wild — when ``length`` is
-    provided we pick whichever of the two candidate sweeps matches it best.
+    The declared ``rot`` (cw/ccw) decides the sweep direction. ``length``
+    is only a tiebreak: it resolves arcs whose ``rot`` attribute is missing,
+    and it overrides a declared ``rot`` when the two candidate sweeps make
+    it unambiguous that the declaration contradicts the stated arclength
+    (some exporters hard-code ``rot="ccw"`` on every curve, which turns
+    every right-hand bend into the major arc the long way round).
     """
     cx, cy = ne_to_xy(seg.center)
     sx, sy = ne_to_xy(seg.start)
@@ -65,11 +74,24 @@ def _arc_geometry(seg: CurveSeg) -> tuple[float, float, float, float, float, flo
         ccw_sweep += 2 * math.pi
     cw_sweep = ccw_sweep - 2 * math.pi  # negative
 
-    if seg.length is not None and seg.length > 0:
-        target = seg.length / r
+    target = seg.length / r if seg.length is not None and seg.length > 0 else None
+    rot = (seg.rot or "").lower()
+    if rot in ("cw", "ccw"):
+        dtheta = cw_sweep if rot == "cw" else ccw_sweep
+        other = ccw_sweep if rot == "cw" else cw_sweep
+        if target is not None:
+            err_decl = abs(abs(dtheta) - target)
+            err_other = abs(abs(other) - target)
+            # Only overrule the declaration when the stated arclength is a
+            # poor fit for it *and* a clearly better fit for the opposite
+            # sweep — never on the sub-percent noise of a rounded length.
+            if err_decl > _ROT_LENGTH_TOL * target and err_other < err_decl:
+                dtheta = other
+    elif target is not None:
         dtheta = ccw_sweep if abs(ccw_sweep - target) <= abs(abs(cw_sweep) - target) else cw_sweep
     else:
-        dtheta = ccw_sweep if seg.rot.lower() != "cw" else cw_sweep
+        # Neither rot nor length: LandXML's own default reading is ccw.
+        dtheta = ccw_sweep
 
     return (cx, cy, r, a0, dtheta, abs(dtheta) * r)
 
