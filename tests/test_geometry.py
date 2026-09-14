@@ -20,6 +20,8 @@ from plugin.geometry_builder import (  # noqa: E402
     arc_points,
     line_points,
     segment_curve_pieces,
+    snap_curve_pieces,
+    snap_curve_pieces_with_z,
     spiral_arc_triples,
     spiral_points,
 )
@@ -548,3 +550,50 @@ def test_alignment_curve_pieces_joins_segments():
     assert isinstance(pieces[1], ArcPiece)
     # Line end coincides with arc start (in QGIS axes).
     assert _close(pieces[0].end, pieces[1].start)
+
+
+def test_snap_curve_pieces_closes_float_gaps_exactly():
+    # Two lines whose join differs by float noise — QGIS tolerates it, OGR
+    # rejects the CompoundCurve as "Non contiguous curves".
+    a = LinePiece((0.0, 0.0), (100.0, 0.0))
+    b = LinePiece((100.0 + 1e-9, 1e-9), (200.0, 0.0))
+    snapped, gap = snap_curve_pieces([a, b])
+    assert snapped[0].end == snapped[1].start  # exact equality, not approx
+    assert gap < 1e-3
+    # Untouched pieces keep their original values.
+    assert snapped[0] == a
+    assert snapped[1].end == b.end
+
+
+def test_snap_curve_pieces_reports_real_gap_and_snaps_arcs():
+    line = LinePiece((0.0, 0.0), (100.0, 0.0))
+    arc = ArcPiece((100.0, 0.5), (150.0, 10.0), (200.0, 0.0))
+    snapped, gap = snap_curve_pieces([line, arc])
+    assert snapped[1].start == (100.0, 0.0)
+    assert math.isclose(gap, 0.5)
+    # Only the start moves; midpoint and end are left alone.
+    assert snapped[1].mid == arc.mid
+    assert snapped[1].end == arc.end
+
+
+def test_snap_curve_pieces_with_z_snaps_elevation_too():
+    a = LinePiece((0.0, 0.0), (100.0, 0.0))
+    b = LinePiece((100.0, 0.0), (200.0, 0.0))
+    snapped, gap = snap_curve_pieces_with_z([(a, [10.0, 12.0]), (b, [0.0, 14.0])])
+    # Z=0 fallback at the join is replaced by the previous piece's Z.
+    assert snapped[1][1] == [12.0, 14.0]
+    assert math.isclose(gap, 12.0)
+    assert snapped[0][1] == [10.0, 12.0]
+
+
+def test_snap_curve_pieces_on_empty_and_single_input():
+    assert snap_curve_pieces([]) == ([], 0.0)
+    only = LinePiece((0.0, 0.0), (1.0, 0.0))
+    assert snap_curve_pieces([only]) == ([only], 0.0)
+
+
+def test_sample_alignment_pieces_are_contiguous_after_snapping():
+    a = parse_alignments(SAMPLE_XML.encode("utf-8"))[0]
+    snapped, _ = snap_curve_pieces(alignment_curve_pieces(a))
+    for prev, nxt in zip(snapped, snapped[1:]):
+        assert prev.end == nxt.start

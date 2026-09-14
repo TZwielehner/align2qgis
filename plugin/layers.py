@@ -55,6 +55,9 @@ from .geometry_builder import (
     segment_curvature,
     segment_curve_pieces,
     segment_length,
+    snap_curve_pieces,
+    snap_curve_pieces_with_z,
+    SNAP_WARN_TOLERANCE,
 )
 from .landxml_parser import (
     CgPointRecord,
@@ -110,14 +113,35 @@ def _curve_wkt(is_3d: bool) -> str:
     return "CompoundCurveZ" if is_3d else "CompoundCurve"
 
 
-def _compound_curve_from_pieces(pieces) -> QgsCompoundCurve:
+def _warn_on_snap_gap(gap: float, context: str) -> None:
+    """Console warning when closing a join gap moved a vertex noticeably.
+
+    Sub-millimetre gaps are routine float noise from the LandXML values and
+    the clothoid integration; a larger one means the source geometry is
+    genuinely discontinuous and the rendered curve differs from the file.
+    """
+    if gap > SNAP_WARN_TOLERANCE:
+        where = f" in {context}" if context else ""
+        print(
+            f"[align2qgis] non-contiguous curve pieces{where}: "
+            f"snapped a gap of {gap:.4f} m"
+        )
+
+
+def _compound_curve_from_pieces(pieces, context: str = "") -> QgsCompoundCurve:
     """Build a QgsCompoundCurve from a list of LinePiece / ArcPiece values.
 
     Lines become two-point ``QgsLineString`` sub-curves; arcs become
     three-point ``QgsCircularString`` sub-curves. QGIS stores this as native
     curved geometry — offsets, buffers, and length() use the analytic
     formulas rather than the chord polyline.
+
+    Pieces are snapped to exactly share their join points first, so the
+    geometry also survives the OGR contiguity check when written to a
+    GeoPackage; *context* names the feature in the gap warning.
     """
+    pieces, gap = snap_curve_pieces(list(pieces))
+    _warn_on_snap_gap(gap, context)
     cc = QgsCompoundCurve()
     for piece in pieces:
         if isinstance(piece, LinePiece):
@@ -135,13 +159,17 @@ def _compound_curve_from_pieces(pieces) -> QgsCompoundCurve:
 
 def _compound_curve_from_pieces_with_z(
     pieces_with_z: list[tuple[object, list[float]]],
+    context: str = "",
 ) -> QgsCompoundCurve:
     """3D counterpart of :func:`_compound_curve_from_pieces`.
 
     Each entry pairs a curve piece with a per-vertex Z list (2 entries for
     a LinePiece, 3 for an ArcPiece). Z is taken verbatim — callers fall
-    back to 0.0 when no profile elevation is available.
+    back to 0.0 when no profile elevation is available. Join points are
+    snapped in X, Y and Z for the same reason as in the 2D builder.
     """
+    pieces_with_z, gap = snap_curve_pieces_with_z(list(pieces_with_z))
+    _warn_on_snap_gap(gap, context)
     cc = QgsCompoundCurve()
     for piece, zs in pieces_with_z:
         if isinstance(piece, LinePiece):
@@ -236,12 +264,16 @@ def build_alignment_layer(
             pieces_with_z = _pieces_with_z(alignment)
             if not pieces_with_z:
                 continue
-            cc = _compound_curve_from_pieces_with_z(pieces_with_z)
+            cc = _compound_curve_from_pieces_with_z(
+                pieces_with_z, f"alignment '{alignment.name}'",
+            )
         else:
             pieces = alignment_curve_pieces(alignment)
             if not pieces:
                 continue
-            cc = _compound_curve_from_pieces(pieces)
+            cc = _compound_curve_from_pieces(
+                pieces, f"alignment '{alignment.name}'",
+            )
         if cc.nCurves() == 0:
             continue
         # ``QgsGeometry(cc)`` would transfer ownership of ``cc``; the
@@ -360,12 +392,16 @@ def build_segment_layer(
                 pwz = pieces_with_z_by_seg.get(idx, [])
                 if not pwz:
                     continue
-                cc = _compound_curve_from_pieces_with_z(pwz)
+                cc = _compound_curve_from_pieces_with_z(
+                    pwz, f"alignment '{alignment.name}' segment {idx}",
+                )
             else:
                 pieces = segment_curve_pieces(seg)
                 if not pieces:
                     continue
-                cc = _compound_curve_from_pieces(pieces)
+                cc = _compound_curve_from_pieces(
+                    pieces, f"alignment '{alignment.name}' segment {idx}",
+                )
             if cc.nCurves() == 0:
                 continue
             geom = QgsGeometry(cc.clone())

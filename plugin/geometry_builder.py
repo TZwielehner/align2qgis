@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, NamedTuple
 
 from .landxml_parser import (
@@ -356,14 +356,73 @@ def segment_curve_pieces(
     raise TypeError(f"unknown segment type: {type(seg).__name__}")
 
 
+# Gaps between consecutive pieces above this (metres) are reported by the
+# snapping helpers below. Sub-millimetre mismatches are expected — segment
+# endpoints come from independent LandXML values and from clothoid
+# integration — while anything larger points at a genuinely broken
+# alignment and is worth a console warning.
+SNAP_WARN_TOLERANCE = 1e-3
+
+
+def snap_curve_pieces(pieces: list[CurvePiece]) -> tuple[list[CurvePiece], float]:
+    """Force consecutive pieces to share an exact join point.
+
+    QGIS tolerates a tiny mismatch between one piece's end and the next
+    piece's start, but OGR does not: writing such a CompoundCurve to a
+    GeoPackage fails with "Non contiguous curves" and the feature is
+    dropped. Each piece's start is therefore replaced by the previous
+    piece's end verbatim.
+
+    Returns the snapped pieces plus the largest gap that had to be closed,
+    so callers can warn when the mismatch exceeds
+    :data:`SNAP_WARN_TOLERANCE`.
+    """
+    out: list[CurvePiece] = []
+    max_gap = 0.0
+    prev_end: XY | None = None
+    for piece in pieces:
+        if prev_end is not None and piece.start != prev_end:
+            max_gap = max(max_gap, math.dist(piece.start, prev_end))
+            piece = replace(piece, start=prev_end)
+        out.append(piece)
+        prev_end = piece.end
+    return out, max_gap
+
+
+def snap_curve_pieces_with_z(
+    pieces_with_z: list[tuple[CurvePiece, list[float]]],
+) -> tuple[list[tuple[CurvePiece, list[float]]], float]:
+    """3D counterpart of :func:`snap_curve_pieces`.
+
+    Snaps X, Y *and* Z — OGR compares the full join vertex — and measures
+    the closed gap in 3D.
+    """
+    out: list[tuple[CurvePiece, list[float]]] = []
+    max_gap = 0.0
+    prev_end: XY | None = None
+    prev_z: float | None = None
+    for piece, zs in pieces_with_z:
+        if prev_end is not None and (piece.start != prev_end or zs[0] != prev_z):
+            max_gap = max(max_gap, math.dist(
+                (piece.start[0], piece.start[1], zs[0]),
+                (prev_end[0], prev_end[1], prev_z),
+            ))
+            piece = replace(piece, start=prev_end)
+            zs = [prev_z, *zs[1:]]
+        out.append((piece, zs))
+        prev_end = piece.end
+        prev_z = zs[-1]
+    return out, max_gap
+
+
 def alignment_curve_pieces(
     alignment: Alignment, max_chord_err: float = 0.01,
 ) -> list[CurvePiece]:
     """Concatenate every segment's curve pieces into one ordered list.
 
-    No deduplication between pieces is needed — adjacent segments already
-    share endpoints by construction, and CompoundCurve assembly tolerates
-    coincident join points.
+    Adjacent segments already share their join points by construction, up
+    to float noise; :func:`snap_curve_pieces` closes that residue before
+    the pieces are handed to a CompoundCurve.
     """
     out: list[CurvePiece] = []
     for seg in alignment.segments:
